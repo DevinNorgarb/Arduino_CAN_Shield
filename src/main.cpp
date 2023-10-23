@@ -1,6 +1,3 @@
-// // Copyright (c) Sandeep Mistry. All rights reserved.
-// // Licensed under the MIT license. See LICENSE file in the project root for full license information.
-
 #include <CAN.h>
 
 void decodeOBDData();
@@ -11,7 +8,6 @@ void setup() {
 
   Serial.println("CAN Receiver");
 
-  // start the CAN bus at 500 kbps
   if (!CAN.begin(500E3)) {
     Serial.println("Starting CAN failed!");
     while (1);
@@ -19,11 +15,9 @@ void setup() {
 }
 
 void loop() {
-  // try to parse packet
   int packetSize = CAN.parsePacket();
 
   if (packetSize) {
-    // received a packet
     Serial.print("Received ");
 
     if (CAN.packetExtended()) {
@@ -31,7 +25,6 @@ void loop() {
     }
 
     if (CAN.packetRtr()) {
-      // Remote transmission request, packet contains no data
       Serial.print("RTR ");
     }
 
@@ -45,11 +38,9 @@ void loop() {
       Serial.print(" and length ");
       Serial.println(packetSize);
 
-      // Decode OBD-II data
+      if (CAN.packetId() == 0x7E8) { // OBD-II response ID
         decodeOBDData();
-      if(CAN.packetId() == 0x7E8) { // OBD-II response ID
       } else {
-        // only print packet data for non-OBD packets
         while (CAN.available()) {
           Serial.print((char)CAN.read());
         }
@@ -62,31 +53,49 @@ void loop() {
 }
 
 void decodeOBDData() {
-  byte pid = CAN.read(); // First byte is the PID
-  Serial.print("PID: " + pid);
-  switch(pid) {
-    case 0x05: // Engine coolant temperature
-      int temp = CAN.read() - 40; // Convert to Celsius
+  byte pid = CAN.read();
+  Serial.print("PID: ");
+  Serial.println(pid, HEX);
+
+  switch (pid) {
+    case 0x05:
+      int temp = CAN.read() - 40;
       Serial.print("Engine Coolant Temperature: ");
       Serial.println(temp);
       break;
 
-    case 0x0C: // Engine RPM
+    case 0x0C:
       int rpm = ((CAN.read() * 256) + CAN.read()) / 4;
       Serial.print("Engine RPM: ");
       Serial.println(rpm);
       break;
 
-    case 0x0D: // Vehicle speed
+    case 0x0D:
       Serial.print("Vehicle Speed: ");
       Serial.println(CAN.read());
       break;
 
-    // Add more cases for other PIDs
-  }
-  // Empty the remaining buffer
-  while (CAN.available()) {
-    CAN.read();
+    case 0x03:
+      byte fuelSystemStatus = CAN.read();
+      Serial.print("Fuel System Status: ");
+      Serial.println(fuelSystemStatus);
+      break;
+
+    case 0x04:
+      byte engineLoad = CAN.read();
+      float calculatedEngineLoad = (engineLoad * 100.0) / 255.0; // Convert to percentage
+      Serial.print("Calculated Engine Load: ");
+      Serial.println(calculatedEngineLoad, 2); // Print with 2 decimal places
+      break;
+
+
+    // ... Add other PID cases as needed
+
+    default:
+      while (CAN.available()) {
+        CAN.read(); // Consume any remaining bytes
+      }
+      break;
   }
 }
 
