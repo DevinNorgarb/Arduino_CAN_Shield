@@ -2,9 +2,11 @@
 
 #include <Arduino.h>
 
+#include "uds_modules.h"
+
 constexpr uint8_t kMaxDtcs = 16;
 constexpr uint8_t kDtcTextLen = 6;
-constexpr uint8_t kAbsDtcTextLen = 10;  // UDS "C1234-08" + null
+constexpr uint8_t kUdsDtcTextLen = 10;  // UDS "C1234-08" + null
 constexpr uint8_t kMaxSupportedPids = 224;
 
 enum DtcStatus : uint8_t {
@@ -20,6 +22,15 @@ enum ScanStatus : uint8_t {
   SCAN_RUNNING = 1,
   SCAN_DONE = 2,
   SCAN_ERROR = 3,
+};
+
+// Read/clear state for one non-OBD UDS module (ABS, airbag, ...).
+struct UdsModuleState {
+  char dtcCodes[kMaxDtcs][kUdsDtcTextLen] = {};
+  uint8_t dtcCount = 0;
+  uint8_t status = DTC_IDLE;
+  volatile bool cmdRead = false;
+  volatile bool cmdClear = false;
 };
 
 struct ObdState {
@@ -83,10 +94,8 @@ struct ObdState {
   uint8_t dtcCount = 0;
   uint8_t dtcStatus = DTC_IDLE;
 
-  // ABS/ESP chassis codes (via UDS on the ABS module - not OBD)
-  char absDtcCodes[kMaxDtcs][kAbsDtcTextLen] = {};
-  uint8_t absDtcCount = 0;
-  uint8_t absStatus = DTC_IDLE;
+  // Non-OBD module codes (ABS, airbag, ...) read/cleared over UDS
+  UdsModuleState udsModules[UDS_MODULE_COUNT];
 
   // Supported-PID scan results (Mode 01 PID 0x00/0x20/...)
   uint8_t supportedPids[kMaxSupportedPids] = {};
@@ -98,8 +107,6 @@ struct ObdState {
   volatile bool cmdReadDtc = false;
   volatile bool cmdClearDtc = false;
   volatile bool cmdScanPids = false;
-  volatile bool cmdReadAbs = false;
-  volatile bool cmdClearAbs = false;
 };
 
 extern ObdState gObdState;
@@ -111,5 +118,5 @@ void resetSessionPeaks();
 const char *canErrorName(uint8_t errorCode);
 const char *canStatusMessage();
 const char *dtcStatusName();
-const char *absStatusName();
+const char *dtcStatusText(uint8_t status);
 const char *scanStatusName();

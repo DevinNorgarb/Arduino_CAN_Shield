@@ -31,12 +31,15 @@
 // Set true for vehicles that require 29-bit CAN IDs (e.g. some Honda)
 #define OBD_USE_EXTENDED_ID false
 
-// VW/VAG ABS-ESP controller UDS addressing for chassis "C" codes (traction
-// control / ESC), which generic OBD mode 03/04 cannot read or clear. These are
-// manufacturer-specific; verify for your vehicle. Default is the common VAG
-// ABS module address (physical request 0x713, response 0x77D).
+// VW/VAG module UDS addressing for codes that generic OBD mode 03/04 cannot
+// reach. These are manufacturer-specific; verify for your vehicle. Defaults are
+// the common VAG addresses (physical request / response pairs, offset +0x6A).
+//   ABS/ESP (address 03): chassis "C" codes - traction control / ESC
+//   Airbag/SRS (address 15): "B" codes - supplemental restraints
 #define ABS_UDS_REQUEST_ID 0x713
 #define ABS_UDS_RESPONSE_ID 0x77D
+#define AIRBAG_UDS_REQUEST_ID 0x715
+#define AIRBAG_UDS_RESPONSE_ID 0x77F
 
 #if OBD_USE_EXTENDED_ID
 #define OBD_REQUEST_ID_EXT 0x18DB33F1UL

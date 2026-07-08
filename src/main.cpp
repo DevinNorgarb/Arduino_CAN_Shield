@@ -386,22 +386,25 @@ void performDtcClear() {
   broadcastObdState();
 }
 
-// ---- ABS/ESP chassis codes (UDS on the ABS module, not OBD) ----
+// ---- Non-OBD module codes (ABS, airbag, ...) via UDS ----
 
-void performAbsRead() {
-  gObdState.absStatus = DTC_READING;
-  gObdState.absDtcCount = 0;
+void performUdsRead(uint8_t moduleId) {
+  const UdsModuleConfig &cfg = kUdsModules[moduleId];
+  UdsModuleState &mod = gObdState.udsModules[moduleId];
+
+  mod.status = DTC_READING;
+  mod.dtcCount = 0;
   broadcastObdState();
 
   // UDS ReadDTCInformation, subfunction reportDTCByStatusMask, mask = all.
   const uint8_t req[] = {0x19, 0x02, 0xFF};
   uint8_t resp[128] = {};
-  const int n = udsRequest(ABS_UDS_REQUEST_ID, ABS_UDS_RESPONSE_ID, req, sizeof(req),
-                           resp, sizeof(resp), 1000);
+  const int n = udsRequest(cfg.reqId, cfg.respId, req, sizeof(req), resp, sizeof(resp),
+                           1000);
 
   // Positive response: 59 02 <availabilityMask> then {hi, mid, lo, status} * N.
   if (n < 3 || resp[0] != 0x59) {
-    gObdState.absStatus = DTC_ERROR;
+    mod.status = DTC_ERROR;
     broadcastObdState();
     return;
   }
@@ -411,38 +414,41 @@ void performAbsRead() {
     if (resp[i] == 0 && resp[i + 1] == 0 && resp[i + 2] == 0) {
       continue;
     }
-    decodeUdsDtc(resp[i], resp[i + 1], resp[i + 2], gObdState.absDtcCodes[count]);
+    decodeUdsDtc(resp[i], resp[i + 1], resp[i + 2], mod.dtcCodes[count]);
     count++;
   }
 
-  gObdState.absDtcCount = count;
-  gObdState.absStatus = DTC_DONE;
-  Serial.printf("ABS/ESP: read %u DTC(s)\n", count);
+  mod.dtcCount = count;
+  mod.status = DTC_DONE;
+  Serial.printf("%s: read %u DTC(s)\n", cfg.key, count);
   broadcastObdState();
 }
 
-void performAbsClear() {
-  gObdState.absStatus = DTC_READING;
+void performUdsClear(uint8_t moduleId) {
+  const UdsModuleConfig &cfg = kUdsModules[moduleId];
+  UdsModuleState &mod = gObdState.udsModules[moduleId];
+
+  mod.status = DTC_READING;
   broadcastObdState();
 
   // Some VAG modules require an extended diagnostic session before clearing.
   const uint8_t session[] = {0x10, 0x03};
   uint8_t scratch[16] = {};
-  udsRequest(ABS_UDS_REQUEST_ID, ABS_UDS_RESPONSE_ID, session, sizeof(session),
-             scratch, sizeof(scratch), 500);
+  udsRequest(cfg.reqId, cfg.respId, session, sizeof(session), scratch, sizeof(scratch),
+             500);
 
   // UDS ClearDiagnosticInformation, group = all (FF FF FF).
   const uint8_t req[] = {0x14, 0xFF, 0xFF, 0xFF};
   uint8_t resp[16] = {};
-  const int n = udsRequest(ABS_UDS_REQUEST_ID, ABS_UDS_RESPONSE_ID, req, sizeof(req),
-                           resp, sizeof(resp), 1500);
+  const int n = udsRequest(cfg.reqId, cfg.respId, req, sizeof(req), resp, sizeof(resp),
+                           1500);
 
   if (n >= 1 && resp[0] == 0x54) {
-    gObdState.absDtcCount = 0;
-    gObdState.absStatus = DTC_CLEARED;
-    Serial.println("ABS/ESP: DTCs cleared");
+    mod.dtcCount = 0;
+    mod.status = DTC_CLEARED;
+    Serial.printf("%s: DTCs cleared\n", cfg.key);
   } else {
-    gObdState.absStatus = DTC_ERROR;
+    mod.status = DTC_ERROR;
   }
   broadcastObdState();
 }
@@ -526,14 +532,15 @@ void handlePendingCommands() {
     performDtcClear();
   }
 
-  if (gObdState.cmdReadAbs) {
-    gObdState.cmdReadAbs = false;
-    performAbsRead();
-  }
-
-  if (gObdState.cmdClearAbs) {
-    gObdState.cmdClearAbs = false;
-    performAbsClear();
+  for (uint8_t i = 0; i < UDS_MODULE_COUNT; i++) {
+    if (gObdState.udsModules[i].cmdRead) {
+      gObdState.udsModules[i].cmdRead = false;
+      performUdsRead(i);
+    }
+    if (gObdState.udsModules[i].cmdClear) {
+      gObdState.udsModules[i].cmdClear = false;
+      performUdsClear(i);
+    }
   }
 }
 
