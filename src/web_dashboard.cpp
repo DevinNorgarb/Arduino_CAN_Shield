@@ -165,6 +165,17 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
     <div class="section">
       <div class="row">
+        <h2 style="margin:0">ABS / ESP (traction control)</h2>
+        <div class="spacer"></div>
+        <button class="primary" id="read-abs">Read codes</button>
+        <button class="danger" id="clear-abs">Clear codes</button>
+      </div>
+      <div class="status" style="margin-top:8px">Chassis "C" codes from the ABS/ESP module (VW-specific, UDS). Won't clear if the fault is currently active.</div>
+      <div class="dtc-list" id="abs-list"><div class="status">Press "Read codes" to scan the ABS module.</div></div>
+    </div>
+
+    <div class="section">
+      <div class="row">
         <h2 style="margin:0">Supported PIDs</h2>
         <span id="pid-count" class="status"></span>
         <div class="spacer"></div>
@@ -386,27 +397,24 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       }).join('');
     }
 
-    function renderDtc(data) {
-      const list = document.getElementById('dtc-list');
-      if (data.dtc_status === 'reading') {
-        list.innerHTML = '<div class="status">Scanning ECU…</div>';
-        return;
-      }
-      if (data.dtc_status === 'cleared') {
+    function renderCodes(listId, status, codes) {
+      const list = document.getElementById(listId);
+      if (status === 'reading') {
+        list.innerHTML = '<div class="status">Scanning…</div>';
+      } else if (status === 'cleared') {
         list.innerHTML = '<div class="status dtc-ok">Codes cleared. Read again to confirm.</div>';
-        return;
-      }
-      if (data.dtc_status === 'error') {
+      } else if (status === 'error') {
         list.innerHTML = '<div class="status">No response / not supported.</div>';
-        return;
+      } else if (status === 'done') {
+        list.innerHTML = (!codes || !codes.length)
+          ? '<div class="status dtc-ok">No stored trouble codes.</div>'
+          : codes.map(c => '<div class="dtc">' + c + '</div>').join('');
       }
-      if (data.dtc_status === 'done') {
-        if (!data.dtcs || !data.dtcs.length) {
-          list.innerHTML = '<div class="status dtc-ok">No stored trouble codes.</div>';
-        } else {
-          list.innerHTML = data.dtcs.map(c => '<div class="dtc">' + c + '</div>').join('');
-        }
-      }
+    }
+
+    function renderDtc(data) {
+      renderCodes('dtc-list', data.dtc_status, data.dtcs);
+      renderCodes('abs-list', data.abs_status, data.abs_dtcs);
     }
 
     const nmeaLines = [], NMEA_MAX = 200;
@@ -448,6 +456,10 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     document.getElementById('read-dtc').onclick = () => send('read_dtc');
     document.getElementById('clear-dtc').onclick = () => {
       if (confirm('Clear all stored trouble codes and turn off the check-engine light?')) send('clear_dtc');
+    };
+    document.getElementById('read-abs').onclick = () => send('read_abs');
+    document.getElementById('clear-abs').onclick = () => {
+      if (confirm('Clear stored ABS/ESP codes? This will not help if the fault is currently active.')) send('clear_abs');
     };
     document.getElementById('rec-toggle').onclick = () => {
       canRecording = !canRecording;
@@ -548,6 +560,14 @@ String buildObdJson() {
   }
   json += "],";
 
+  json += "\"abs_status\":\"" + String(absStatusName()) + "\",";
+  json += "\"abs_dtcs\":[";
+  for (uint8_t i = 0; i < gObdState.absDtcCount; i++) {
+    if (i > 0) json += ",";
+    json += "\"" + String(gObdState.absDtcCodes[i]) + "\"";
+  }
+  json += "],";
+
   json += "\"pid_scan_status\":\"" + String(scanStatusName()) + "\",";
   json += "\"supported_count\":" + String(gObdState.supportedCount) + ",";
   json += "\"supported_pids\":[";
@@ -585,6 +605,10 @@ void handleWsCommand(const String &cmd) {
     gObdState.cmdClearDtc = true;
   } else if (cmd == "scan_pids") {
     gObdState.cmdScanPids = true;
+  } else if (cmd == "read_abs") {
+    gObdState.cmdReadAbs = true;
+  } else if (cmd == "clear_abs") {
+    gObdState.cmdClearAbs = true;
   } else if (cmd == "rec_start") {
     canRecordStart();
   } else if (cmd == "rec_stop") {

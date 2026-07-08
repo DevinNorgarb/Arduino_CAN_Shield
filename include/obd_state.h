@@ -4,6 +4,7 @@
 
 constexpr uint8_t kMaxDtcs = 16;
 constexpr uint8_t kDtcTextLen = 6;
+constexpr uint8_t kAbsDtcTextLen = 10;  // UDS "C1234-08" + null
 constexpr uint8_t kMaxSupportedPids = 224;
 
 enum DtcStatus : uint8_t {
@@ -77,10 +78,15 @@ struct ObdState {
   uint32_t lastUpdateMs = 0;
   uint32_t lastStatusBroadcastMs = 0;
 
-  // Diagnostic trouble codes
+  // Diagnostic trouble codes (emissions / powertrain, via OBD mode 03/04)
   char dtcCodes[kMaxDtcs][kDtcTextLen] = {};
   uint8_t dtcCount = 0;
   uint8_t dtcStatus = DTC_IDLE;
+
+  // ABS/ESP chassis codes (via UDS on the ABS module - not OBD)
+  char absDtcCodes[kMaxDtcs][kAbsDtcTextLen] = {};
+  uint8_t absDtcCount = 0;
+  uint8_t absStatus = DTC_IDLE;
 
   // Supported-PID scan results (Mode 01 PID 0x00/0x20/...)
   uint8_t supportedPids[kMaxSupportedPids] = {};
@@ -92,6 +98,8 @@ struct ObdState {
   volatile bool cmdReadDtc = false;
   volatile bool cmdClearDtc = false;
   volatile bool cmdScanPids = false;
+  volatile bool cmdReadAbs = false;
+  volatile bool cmdClearAbs = false;
 };
 
 extern ObdState gObdState;
@@ -103,4 +111,5 @@ void resetSessionPeaks();
 const char *canErrorName(uint8_t errorCode);
 const char *canStatusMessage();
 const char *dtcStatusName();
+const char *absStatusName();
 const char *scanStatusName();

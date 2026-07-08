@@ -7,14 +7,20 @@
 #include "web_dashboard.h"
 #include "gps.h"
 #include "can_recorder.h"
+#include "can_io.h"
+#include "uds_client.h"
 
 MCP_CAN canBus(CAN_CS_PIN);
 
 // Physical request ID for the engine ECU (used for ISO-TP flow control).
 constexpr unsigned long kEcuPhysicalRequestId = 0x7E0;
 
-// All CAN traffic flows through these two wrappers so the recorder sees every
-// frame (both our requests and the ECU's responses) from a single choke point.
+// All CAN traffic flows through these wrappers so the recorder sees every frame
+// (both our requests and the ECU's responses) from a single choke point.
+bool canAvailable() {
+  return canBus.checkReceive() == CAN_MSGAVAIL;
+}
+
 uint8_t canReadFrame(unsigned long *id, uint8_t *len, uint8_t *data) {
   const uint8_t status = canBus.readMsgBuf(id, len, data);
   if (status == CAN_OK) {
@@ -231,6 +237,17 @@ void decodeDtcPair(uint8_t a, uint8_t b, char *out) {
   out[5] = '\0';
 }
 
+// UDS DTCs are 3 bytes: the first two decode like an OBD code (e.g. C1234) and
+// the third is a failure-type byte, shown as a suffix (e.g. C1234-08).
+void decodeUdsDtc(uint8_t a, uint8_t b, uint8_t c, char *out) {
+  decodeDtcPair(a, b, out);
+  const char *hex = "0123456789ABCDEF";
+  out[5] = '-';
+  out[6] = hex[(c & 0xF0) >> 4];
+  out[7] = hex[c & 0x0F];
+  out[8] = '\0';
+}
+
 // Reads a Mode 03 response, following ISO-TP for multi-frame replies.
 // Returns the number of DTC data bytes copied into buf, or -1 on failure.
 int readDtcResponse(uint8_t *buf, size_t bufSize) {
@@ -369,6 +386,67 @@ void performDtcClear() {
   broadcastObdState();
 }
 
+// ---- ABS/ESP chassis codes (UDS on the ABS module, not OBD) ----
+
+void performAbsRead() {
+  gObdState.absStatus = DTC_READING;
+  gObdState.absDtcCount = 0;
+  broadcastObdState();
+
+  // UDS ReadDTCInformation, subfunction reportDTCByStatusMask, mask = all.
+  const uint8_t req[] = {0x19, 0x02, 0xFF};
+  uint8_t resp[128] = {};
+  const int n = udsRequest(ABS_UDS_REQUEST_ID, ABS_UDS_RESPONSE_ID, req, sizeof(req),
+                           resp, sizeof(resp), 1000);
+
+  // Positive response: 59 02 <availabilityMask> then {hi, mid, lo, status} * N.
+  if (n < 3 || resp[0] != 0x59) {
+    gObdState.absStatus = DTC_ERROR;
+    broadcastObdState();
+    return;
+  }
+
+  uint8_t count = 0;
+  for (int i = 3; i + 3 < n && count < kMaxDtcs; i += 4) {
+    if (resp[i] == 0 && resp[i + 1] == 0 && resp[i + 2] == 0) {
+      continue;
+    }
+    decodeUdsDtc(resp[i], resp[i + 1], resp[i + 2], gObdState.absDtcCodes[count]);
+    count++;
+  }
+
+  gObdState.absDtcCount = count;
+  gObdState.absStatus = DTC_DONE;
+  Serial.printf("ABS/ESP: read %u DTC(s)\n", count);
+  broadcastObdState();
+}
+
+void performAbsClear() {
+  gObdState.absStatus = DTC_READING;
+  broadcastObdState();
+
+  // Some VAG modules require an extended diagnostic session before clearing.
+  const uint8_t session[] = {0x10, 0x03};
+  uint8_t scratch[16] = {};
+  udsRequest(ABS_UDS_REQUEST_ID, ABS_UDS_RESPONSE_ID, session, sizeof(session),
+             scratch, sizeof(scratch), 500);
+
+  // UDS ClearDiagnosticInformation, group = all (FF FF FF).
+  const uint8_t req[] = {0x14, 0xFF, 0xFF, 0xFF};
+  uint8_t resp[16] = {};
+  const int n = udsRequest(ABS_UDS_REQUEST_ID, ABS_UDS_RESPONSE_ID, req, sizeof(req),
+                           resp, sizeof(resp), 1500);
+
+  if (n >= 1 && resp[0] == 0x54) {
+    gObdState.absDtcCount = 0;
+    gObdState.absStatus = DTC_CLEARED;
+    Serial.println("ABS/ESP: DTCs cleared");
+  } else {
+    gObdState.absStatus = DTC_ERROR;
+  }
+  broadcastObdState();
+}
+
 // ---- Supported-PID scan (Mode 01 PIDs 0x00 / 0x20 / ... / 0xC0) ----
 
 void performPidScan() {
@@ -446,6 +524,16 @@ void handlePendingCommands() {
   if (gObdState.cmdClearDtc) {
     gObdState.cmdClearDtc = false;
     performDtcClear();
+  }
+
+  if (gObdState.cmdReadAbs) {
+    gObdState.cmdReadAbs = false;
+    performAbsRead();
+  }
+
+  if (gObdState.cmdClearAbs) {
+    gObdState.cmdClearAbs = false;
+    performAbsClear();
   }
 }
 
