@@ -6,11 +6,28 @@
 #include "obd_state.h"
 #include "web_dashboard.h"
 #include "gps.h"
+#include "can_recorder.h"
 
 MCP_CAN canBus(CAN_CS_PIN);
 
 // Physical request ID for the engine ECU (used for ISO-TP flow control).
 constexpr unsigned long kEcuPhysicalRequestId = 0x7E0;
+
+// All CAN traffic flows through these two wrappers so the recorder sees every
+// frame (both our requests and the ECU's responses) from a single choke point.
+uint8_t canReadFrame(unsigned long *id, uint8_t *len, uint8_t *data) {
+  const uint8_t status = canBus.readMsgBuf(id, len, data);
+  if (status == CAN_OK) {
+    canRecordFrame(false, *id, *len, data);
+  }
+  return status;
+}
+
+uint8_t canSendFrame(unsigned long id, uint8_t ext, uint8_t len, const uint8_t *data) {
+  const uint8_t status = canBus.sendMsgBuf(id, ext, len, const_cast<uint8_t *>(data));
+  canRecordFrame(true, id, len, data);
+  return status;
+}
 
 struct ObdPid {
   uint8_t pid;
@@ -35,11 +52,16 @@ const ObdPid kPidsToPoll[] = {
 };
 
 constexpr size_t kPidCount = sizeof(kPidsToPoll) / sizeof(kPidsToPoll[0]);
-constexpr uint8_t kMaxConsecutiveTimeouts = 4;
+constexpr uint8_t kMaxConsecutiveTimeouts = 5;
+// How long a PID stays in "slow retry" mode after repeated timeouts. This is a
+// backoff, NOT a permanent disable: a PID that looks unsupported at boot (bus
+// asleep / ignition warming up) is retried again later instead of latched off.
+constexpr uint32_t kUnsupportedRetryMs = 15000;
+constexpr uint32_t kPollResponseTimeoutMs = 220;
 
 uint32_t lastPollMs[kPidCount] = {};
 uint8_t consecutiveTimeouts[kPidCount] = {};
-bool pidUnsupported[kPidCount] = {};
+uint32_t pidRetryAtMs[kPidCount] = {};
 
 uint8_t lastLoggedCanError = 0xFF;
 uint32_t lastErrorLogMs = 0;
@@ -61,7 +83,7 @@ bool detectCanBusActivity(uint32_t listenMs) {
       uint8_t rxLen = 0;
       uint8_t rxData[8] = {};
 
-      if (canBus.readMsgBuf(&rxId, &rxLen, rxData) == CAN_OK) {
+      if (canReadFrame(&rxId, &rxLen, rxData) == CAN_OK) {
         Serial.printf("CAN bus active - saw frame id=0x%lX len=%u\n", rxId, rxLen);
         return true;
       }
@@ -98,9 +120,9 @@ bool sendServiceRequest(uint8_t mode, uint8_t pid, bool hasPid, uint8_t &errorCo
   const uint8_t numBytes = hasPid ? 0x02 : 0x01;
   uint8_t request[8] = {numBytes, mode, pid, 0, 0, 0, 0, 0};
 #if OBD_USE_EXTENDED_ID
-  errorCode = canBus.sendMsgBuf(OBD_REQUEST_ID_EXT, 1, 8, request);
+  errorCode = canSendFrame(OBD_REQUEST_ID_EXT, 1, 8, request);
 #else
-  errorCode = canBus.sendMsgBuf(OBD_REQUEST_ID, 0, 8, request);
+  errorCode = canSendFrame(OBD_REQUEST_ID, 0, 8, request);
 #endif
   return errorCode == CAN_OK;
 }
@@ -118,7 +140,7 @@ bool waitForObdResponse(uint8_t expectedPid, uint8_t *response, uint8_t &length,
     uint8_t rxLen = 0;
     uint8_t rxData[8] = {};
 
-    if (canBus.readMsgBuf(&rxId, &rxLen, rxData) != CAN_OK) {
+    if (canReadFrame(&rxId, &rxLen, rxData) != CAN_OK) {
       continue;
     }
 
@@ -153,11 +175,13 @@ void logCanErrorThrottled(uint8_t errorCode, uint8_t pid) {
 }
 
 void pollObdPid(const ObdPid &pidDef, size_t index) {
-  if (pidUnsupported[index]) {
+  const uint32_t now = millis();
+
+  // In backoff? Skip until the retry time, then try once more.
+  if (pidRetryAtMs[index] != 0 && (int32_t)(pidRetryAtMs[index] - now) > 0) {
     return;
   }
 
-  const uint32_t now = millis();
   if ((now - lastPollMs[index]) < pidDef.intervalMs) {
     return;
   }
@@ -177,16 +201,19 @@ void pollObdPid(const ObdPid &pidDef, size_t index) {
   uint8_t response[8] = {};
   uint8_t responseLen = 0;
 
-  if (!waitForObdResponse(pidDef.pid, response, responseLen, 150)) {
+  if (!waitForObdResponse(pidDef.pid, response, responseLen, kPollResponseTimeoutMs)) {
     recordCanTimeout();
     if (++consecutiveTimeouts[index] >= kMaxConsecutiveTimeouts) {
-      pidUnsupported[index] = true;
-      Serial.printf("Disabling unsupported PID 0x%02X (%s)\n", pidDef.pid, pidDef.name);
+      pidRetryAtMs[index] = now + kUnsupportedRetryMs;
+      consecutiveTimeouts[index] = 0;
+      Serial.printf("PID 0x%02X (%s) not answering - backing off %us\n", pidDef.pid,
+                    pidDef.name, kUnsupportedRetryMs / 1000);
     }
     return;
   }
 
   consecutiveTimeouts[index] = 0;
+  pidRetryAtMs[index] = 0;
   updateObdState(pidDef.pid, response, responseLen);
   broadcastObdState();
 }
@@ -220,7 +247,7 @@ int readDtcResponse(uint8_t *buf, size_t bufSize) {
     unsigned long rxId = 0;
     uint8_t rxLen = 0;
     uint8_t rxData[8] = {};
-    if (canBus.readMsgBuf(&rxId, &rxLen, rxData) != CAN_OK || !isObdResponseId(rxId)) {
+    if (canReadFrame(&rxId, &rxLen, rxData) != CAN_OK || !isObdResponseId(rxId)) {
       continue;
     }
 
@@ -248,7 +275,7 @@ int readDtcResponse(uint8_t *buf, size_t bufSize) {
 
       // Send flow control: clear to send, no block size, no separation time.
       uint8_t fc[8] = {0x30, 0x00, 0x00, 0, 0, 0, 0, 0};
-      canBus.sendMsgBuf(kEcuPhysicalRequestId, 0, 8, fc);
+      canSendFrame(kEcuPhysicalRequestId, 0, 8, fc);
       continue;
     }
 
@@ -328,7 +355,7 @@ void performDtcClear() {
     unsigned long rxId = 0;
     uint8_t rxLen = 0;
     uint8_t rxData[8] = {};
-    if (canBus.readMsgBuf(&rxId, &rxLen, rxData) == CAN_OK && isObdResponseId(rxId) &&
+    if (canReadFrame(&rxId, &rxLen, rxData) == CAN_OK && isObdResponseId(rxId) &&
         rxData[1] == 0x44) {
       gObdState.dtcCount = 0;
       gObdState.dtcStatus = DTC_CLEARED;
@@ -387,6 +414,14 @@ void performPidScan() {
 
   gObdState.pidScanStatus = SCAN_DONE;
   Serial.printf("PID scan complete: %u supported PIDs\n", gObdState.supportedCount);
+
+  // The scan just proved the bus is awake, so clear any poll backoff and let
+  // every live PID retry immediately instead of waiting out its backoff window.
+  for (size_t i = 0; i < kPidCount; i++) {
+    consecutiveTimeouts[i] = 0;
+    pidRetryAtMs[i] = 0;
+  }
+
   broadcastObdState();
 }
 

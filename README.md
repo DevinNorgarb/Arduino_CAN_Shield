@@ -100,6 +100,60 @@ coolant_c=88
 engine_load_pct=22.4
 ```
 
+## Record & replay CAN data (bench debugging)
+
+Capture raw CAN traffic in the car, then replay it at your desk so you can
+develop the firmware and dashboard without a vehicle.
+
+### 1. Record a drive
+
+1. Open the dashboard and expand the **CAN recorder** section.
+2. Press **Start recording**, drive / idle to capture the data you want, then
+   **Stop recording**.
+3. Press **Download .log** to save a `capture-<timestamp>.log` file.
+
+Frames stream live over the WebSocket in SocketCAN
+[candump](https://github.com/linux-can/can-utils) format, e.g.:
+
+```
+(0.123456) rx 7E8#03410C1AF0000000
+(0.120000) tx 7DF#02010C0000000000
+```
+
+`tx` = a request the ESP32 sent, `rx` = a response from the car. This file
+imports directly into **SavvyCAN** and replays with **canplayer**
+(`canplayer vcan0=rx -I capture.log`).
+
+### 2. Build a bench ECU simulator (second ESP32 + MCP2515)
+
+Instead of faking data inside the firmware, a second ESP32 acts like the car's
+ECU on a tiny bench bus. The main board runs the **real, unmodified firmware**.
+
+Wire the two MCP2515 modules together — no car needed:
+
+| Simulator MCP2515 | Main board MCP2515 |
+|-------------------|--------------------|
+| CANH (H)          | CANH (H)           |
+| CANL (L)          | CANL (L)           |
+
+Both modules' onboard 120 Ω resistors form a correctly terminated 2-node bus.
+Power each board over USB. SPI wiring on the simulator board is identical to the
+main board (same pins from `config.h`).
+
+Turn your recording into the simulator's response table, then flash it:
+
+```bash
+python scripts/log_to_header.py capture.log   # -> src/ecu_sim/recorded_responses.h
+pio run -e esp32-ecu-sim -t upload            # flash the SECOND ESP32
+pio run -e nodemcu-32s -t upload              # flash the main board (unchanged)
+```
+
+The simulator listens for the main board's OBD requests and replays the real
+recorded responses (including multi-frame ISO-TP DTC replies), stepping through
+the captured drive one sample per request — so the dashboard gauges, charts, PID
+scan, and DTC read all behave like the real car. A synthetic demo table ships by
+default, so `esp32-ecu-sim` builds and runs even before you've recorded anything.
+
 ## Troubleshooting
 
 - **`request_failed` / send "no ACK"**: The transceiver isn't on the bus. Most common causes: (1) MCP2515 `VCC` on 3V3 instead of **5V**; (2) CAN-H/CAN-L swapped or not connected to OBD pins 6/14; (3) no shared ground (OBD pin 5); (4) ignition not ON.

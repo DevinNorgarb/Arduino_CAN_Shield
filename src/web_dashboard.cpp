@@ -7,6 +7,7 @@
 #include "config.h"
 #include "obd_state.h"
 #include "web_dashboard.h"
+#include "can_recorder.h"
 
 namespace {
 
@@ -170,6 +171,19 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
         <button class="primary" id="scan-pids">Scan vehicle</button>
       </div>
       <div class="pid-list" id="pid-list"><div class="status">Press "Scan vehicle" to list every PID the car supports.</div></div>
+    </div>
+
+    <div class="section">
+      <div class="row">
+        <h2 style="margin:0">CAN recorder</h2>
+        <div class="spacer"></div>
+        <button class="primary" id="rec-toggle">Start recording</button>
+        <button id="rec-download">Download .log</button>
+      </div>
+      <details class="nmea" id="can-details" style="margin-top:12px">
+        <summary>Raw CAN frames <span class="count" id="can-count"></span></summary>
+        <div class="nmea-log" id="can-log"><span class="nmea-empty">Not recording. Press "Start recording" to capture raw frames.</span></div>
+      </details>
     </div>
 
     <div class="section">
@@ -408,6 +422,24 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       if (atBottom) log.scrollTop = log.scrollHeight;
     }
 
+    const canLines = [], CAN_VIEW_MAX = 300;
+    let canRecording = false;
+    function appendCan(line) {
+      canLines.push(line);
+      document.getElementById('can-count').textContent = '(' + canLines.length + ')';
+      const log = document.getElementById('can-log');
+      const view = canLines.length > CAN_VIEW_MAX ? canLines.slice(-CAN_VIEW_MAX) : canLines;
+      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
+      log.textContent = view.join('\n');
+      if (atBottom) log.scrollTop = log.scrollHeight;
+    }
+    function updateRecUi() {
+      const b = document.getElementById('rec-toggle');
+      b.textContent = canRecording ? 'Stop recording' : 'Start recording';
+      b.classList.toggle('danger', canRecording);
+      b.classList.toggle('primary', !canRecording);
+    }
+
     let socket, reconnectTimer;
     function send(cmd) { if (socket && socket.readyState === 1) socket.send(cmd); }
 
@@ -416,6 +448,27 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     document.getElementById('read-dtc').onclick = () => send('read_dtc');
     document.getElementById('clear-dtc').onclick = () => {
       if (confirm('Clear all stored trouble codes and turn off the check-engine light?')) send('clear_dtc');
+    };
+    document.getElementById('rec-toggle').onclick = () => {
+      canRecording = !canRecording;
+      if (canRecording) {
+        canLines.length = 0;
+        document.getElementById('can-count').textContent = '';
+        document.getElementById('can-log').textContent = '';
+        document.getElementById('can-details').open = true;
+      }
+      send(canRecording ? 'rec_start' : 'rec_stop');
+      updateRecUi();
+    };
+    document.getElementById('rec-download').onclick = () => {
+      if (!canLines.length) { alert('No frames captured yet.'); return; }
+      const blob = new Blob([canLines.join('\n') + '\n'], { type: 'text/plain' });
+      const a = document.createElement('a');
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      a.href = URL.createObjectURL(blob);
+      a.download = 'capture-' + ts + '.log';
+      a.click();
+      URL.revokeObjectURL(a.href);
     };
 
     function connect() {
@@ -428,6 +481,11 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       socket.onmessage = (event) => {
         const data = JSON.parse(event.data);
         if (data.nmea !== undefined) { appendNmea(data.nmea); return; }
+        if (data.can !== undefined) { appendCan(data.can); return; }
+        if (typeof data.rec_active === 'boolean' && data.rec_active !== canRecording) {
+          canRecording = data.rec_active;
+          updateRecUi();
+        }
         render(data);
       };
       socket.onclose = () => {
@@ -510,6 +568,8 @@ String buildObdJson() {
   json += "\"can_ok\":" + boolStr(gObdState.canReady && gObdState.lastCanError == 0) + ",";
   json += "\"bus_active\":" + boolStr(gObdState.busActive) + ",";
   json += "\"can_message\":\"" + String(canStatusMessage()) + "\",";
+  json += "\"rec_active\":" + boolStr(canRecordActive()) + ",";
+  json += "\"rec_count\":" + String(canRecordCount()) + ",";
   json += "\"age_ms\":" + String(ageMs);
   json += "}";
 
@@ -525,6 +585,10 @@ void handleWsCommand(const String &cmd) {
     gObdState.cmdClearDtc = true;
   } else if (cmd == "scan_pids") {
     gObdState.cmdScanPids = true;
+  } else if (cmd == "rec_start") {
+    canRecordStart();
+  } else if (cmd == "rec_stop") {
+    canRecordStop();
   }
 }
 
@@ -647,6 +711,19 @@ void broadcastNmea(const String &line) {
     }
     json += c;
   }
+  json += "\"}";
+  ws.textAll(json);
+}
+
+void broadcastCanFrame(const String &line) {
+  if (ws.count() == 0 || line.length() == 0) {
+    return;
+  }
+
+  // candump lines contain only ASCII digits, letters, and "().#-" - no JSON
+  // escaping needed.
+  String json = "{\"can\":\"";
+  json += line;
   json += "\"}";
   ws.textAll(json);
 }
