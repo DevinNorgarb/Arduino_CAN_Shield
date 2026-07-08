@@ -154,7 +154,7 @@ const char *canStatusMessage() {
   return "Receiving OBD data";
 }
 
-static const char *dtcStatusToName(uint8_t status) {
+const char *dtcStatusText(uint8_t status) {
   switch (status) {
     case DTC_READING:
       return "reading";
@@ -170,11 +170,7 @@ static const char *dtcStatusToName(uint8_t status) {
 }
 
 const char *dtcStatusName() {
-  return dtcStatusToName(gObdState.dtcStatus);
-}
-
-const char *absStatusName() {
-  return dtcStatusToName(gObdState.absStatus);
+  return dtcStatusText(gObdState.dtcStatus);
 }
 
 const char *scanStatusName() {

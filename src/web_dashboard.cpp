@@ -176,6 +176,17 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
     <div class="section">
       <div class="row">
+        <h2 style="margin:0">Airbag / SRS</h2>
+        <div class="spacer"></div>
+        <button class="primary" id="read-airbag">Read codes</button>
+        <button class="danger" id="clear-airbag">Clear codes</button>
+      </div>
+      <div class="alert" style="margin:8px 0 0">⚠ Safety-critical. Reading is safe. Clearing only helps for soft/stored codes and will NOT clear an active fault or locked crash data — never rely on a cleared code to mean the airbag is functional. Disconnect the battery before working on SRS wiring.</div>
+      <div class="dtc-list" id="airbag-list"><div class="status">Press "Read codes" to scan the airbag module.</div></div>
+    </div>
+
+    <div class="section">
+      <div class="row">
         <h2 style="margin:0">Supported PIDs</h2>
         <span id="pid-count" class="status"></span>
         <div class="spacer"></div>
@@ -415,6 +426,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     function renderDtc(data) {
       renderCodes('dtc-list', data.dtc_status, data.dtcs);
       renderCodes('abs-list', data.abs_status, data.abs_dtcs);
+      renderCodes('airbag-list', data.airbag_status, data.airbag_dtcs);
     }
 
     const nmeaLines = [], NMEA_MAX = 200;
@@ -460,6 +472,10 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     document.getElementById('read-abs').onclick = () => send('read_abs');
     document.getElementById('clear-abs').onclick = () => {
       if (confirm('Clear stored ABS/ESP codes? This will not help if the fault is currently active.')) send('clear_abs');
+    };
+    document.getElementById('read-airbag').onclick = () => send('read_airbag');
+    document.getElementById('clear-airbag').onclick = () => {
+      if (confirm('SAFETY: Clearing airbag/SRS codes will NOT fix an active fault or crash data, and a cleared code does not mean the airbag will deploy. Only proceed for a known soft code. Continue?')) send('clear_airbag');
     };
     document.getElementById('rec-toggle').onclick = () => {
       canRecording = !canRecording;
@@ -560,13 +576,17 @@ String buildObdJson() {
   }
   json += "],";
 
-  json += "\"abs_status\":\"" + String(absStatusName()) + "\",";
-  json += "\"abs_dtcs\":[";
-  for (uint8_t i = 0; i < gObdState.absDtcCount; i++) {
-    if (i > 0) json += ",";
-    json += "\"" + String(gObdState.absDtcCodes[i]) + "\"";
+  for (uint8_t m = 0; m < UDS_MODULE_COUNT; m++) {
+    const UdsModuleState &mod = gObdState.udsModules[m];
+    const String key = kUdsModules[m].key;
+    json += "\"" + key + "_status\":\"" + String(dtcStatusText(mod.status)) + "\",";
+    json += "\"" + key + "_dtcs\":[";
+    for (uint8_t i = 0; i < mod.dtcCount; i++) {
+      if (i > 0) json += ",";
+      json += "\"" + String(mod.dtcCodes[i]) + "\"";
+    }
+    json += "],";
   }
-  json += "],";
 
   json += "\"pid_scan_status\":\"" + String(scanStatusName()) + "\",";
   json += "\"supported_count\":" + String(gObdState.supportedCount) + ",";
@@ -605,14 +625,23 @@ void handleWsCommand(const String &cmd) {
     gObdState.cmdClearDtc = true;
   } else if (cmd == "scan_pids") {
     gObdState.cmdScanPids = true;
-  } else if (cmd == "read_abs") {
-    gObdState.cmdReadAbs = true;
-  } else if (cmd == "clear_abs") {
-    gObdState.cmdClearAbs = true;
   } else if (cmd == "rec_start") {
     canRecordStart();
   } else if (cmd == "rec_stop") {
     canRecordStop();
+  } else {
+    // UDS module commands: read_<key> / clear_<key> (e.g. read_abs, clear_airbag)
+    for (uint8_t i = 0; i < UDS_MODULE_COUNT; i++) {
+      const String key = kUdsModules[i].key;
+      if (cmd == "read_" + key) {
+        gObdState.udsModules[i].cmdRead = true;
+        return;
+      }
+      if (cmd == "clear_" + key) {
+        gObdState.udsModules[i].cmdClear = true;
+        return;
+      }
+    }
   }
 }
 
