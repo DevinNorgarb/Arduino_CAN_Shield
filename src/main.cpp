@@ -5,10 +5,11 @@
 #include "config.h"
 #include "obd_state.h"
 #include "web_dashboard.h"
+#include "elm327.h"
 #include "gps.h"
 #include "can_recorder.h"
 #include "can_io.h"
-#include "uds_client.h"
+#include "uds_scan.h"
 
 MCP_CAN canBus(CAN_CS_PIN);
 
@@ -198,6 +199,13 @@ void pollObdPid(const ObdPid &pidDef, size_t index) {
   if (!sendServiceRequest(0x01, pidDef.pid, true, sendError)) {
     recordCanSendError(sendError);
     logCanErrorThrottled(sendError, pidDef.pid);
+    // No ACK / TX stuck: car not on the bus. Pause every PID so we don't
+    // fill the MCP2515 while WiFi/BT share the radio.
+    if (sendError == 6 || sendError == 7) {
+      for (size_t i = 0; i < kPidCount; i++) {
+        pidRetryAtMs[i] = now + 5000;
+      }
+    }
     broadcastObdState();
     return;
   }
@@ -226,27 +234,6 @@ void pollObdPid(const ObdPid &pidDef, size_t index) {
 
 // ---- Diagnostic trouble codes (Mode 03 / Mode 04) ----
 
-void decodeDtcPair(uint8_t a, uint8_t b, char *out) {
-  static const char kTypes[] = {'P', 'C', 'B', 'U'};
-  out[0] = kTypes[(a & 0xC0) >> 6];
-  out[1] = '0' + ((a & 0x30) >> 4);
-  const char *hex = "0123456789ABCDEF";
-  out[2] = hex[a & 0x0F];
-  out[3] = hex[(b & 0xF0) >> 4];
-  out[4] = hex[b & 0x0F];
-  out[5] = '\0';
-}
-
-// UDS DTCs are 3 bytes: the first two decode like an OBD code (e.g. C1234) and
-// the third is a failure-type byte, shown as a suffix (e.g. C1234-08).
-void decodeUdsDtc(uint8_t a, uint8_t b, uint8_t c, char *out) {
-  decodeDtcPair(a, b, out);
-  const char *hex = "0123456789ABCDEF";
-  out[5] = '-';
-  out[6] = hex[(c & 0xF0) >> 4];
-  out[7] = hex[c & 0x0F];
-  out[8] = '\0';
-}
 
 // Reads a Mode 03 response, following ISO-TP for multi-frame replies.
 // Returns the number of DTC data bytes copied into buf, or -1 on failure.
@@ -386,73 +373,6 @@ void performDtcClear() {
   broadcastObdState();
 }
 
-// ---- Non-OBD module codes (ABS, airbag, ...) via UDS ----
-
-void performUdsRead(uint8_t moduleId) {
-  const UdsModuleConfig &cfg = kUdsModules[moduleId];
-  UdsModuleState &mod = gObdState.udsModules[moduleId];
-
-  mod.status = DTC_READING;
-  mod.dtcCount = 0;
-  broadcastObdState();
-
-  // UDS ReadDTCInformation, subfunction reportDTCByStatusMask, mask = all.
-  const uint8_t req[] = {0x19, 0x02, 0xFF};
-  uint8_t resp[128] = {};
-  const int n = udsRequest(cfg.reqId, cfg.respId, req, sizeof(req), resp, sizeof(resp),
-                           1000);
-
-  // Positive response: 59 02 <availabilityMask> then {hi, mid, lo, status} * N.
-  if (n < 3 || resp[0] != 0x59) {
-    mod.status = DTC_ERROR;
-    broadcastObdState();
-    return;
-  }
-
-  uint8_t count = 0;
-  for (int i = 3; i + 3 < n && count < kMaxDtcs; i += 4) {
-    if (resp[i] == 0 && resp[i + 1] == 0 && resp[i + 2] == 0) {
-      continue;
-    }
-    decodeUdsDtc(resp[i], resp[i + 1], resp[i + 2], mod.dtcCodes[count]);
-    count++;
-  }
-
-  mod.dtcCount = count;
-  mod.status = DTC_DONE;
-  Serial.printf("%s: read %u DTC(s)\n", cfg.key, count);
-  broadcastObdState();
-}
-
-void performUdsClear(uint8_t moduleId) {
-  const UdsModuleConfig &cfg = kUdsModules[moduleId];
-  UdsModuleState &mod = gObdState.udsModules[moduleId];
-
-  mod.status = DTC_READING;
-  broadcastObdState();
-
-  // Some VAG modules require an extended diagnostic session before clearing.
-  const uint8_t session[] = {0x10, 0x03};
-  uint8_t scratch[16] = {};
-  udsRequest(cfg.reqId, cfg.respId, session, sizeof(session), scratch, sizeof(scratch),
-             500);
-
-  // UDS ClearDiagnosticInformation, group = all (FF FF FF).
-  const uint8_t req[] = {0x14, 0xFF, 0xFF, 0xFF};
-  uint8_t resp[16] = {};
-  const int n = udsRequest(cfg.reqId, cfg.respId, req, sizeof(req), resp, sizeof(resp),
-                           1500);
-
-  if (n >= 1 && resp[0] == 0x54) {
-    mod.dtcCount = 0;
-    mod.status = DTC_CLEARED;
-    Serial.printf("%s: DTCs cleared\n", cfg.key);
-  } else {
-    mod.status = DTC_ERROR;
-  }
-  broadcastObdState();
-}
-
 // ---- Supported-PID scan (Mode 01 PIDs 0x00 / 0x20 / ... / 0xC0) ----
 
 void performPidScan() {
@@ -522,6 +442,11 @@ void handlePendingCommands() {
     performPidScan();
   }
 
+  if (gObdState.cmdScanEcus) {
+    gObdState.cmdScanEcus = false;
+    performEcuScan();
+  }
+
   if (gObdState.cmdReadDtc) {
     gObdState.cmdReadDtc = false;
     performDtcRead();
@@ -548,26 +473,38 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
+  pinMode(CAN_CS_PIN, OUTPUT);
+  digitalWrite(CAN_CS_PIN, HIGH);
+
   Serial.println("NodeMCU-32S OBD CAN reader");
   Serial.println("Plug MCP2515 OBD adapter into vehicle OBD-II port");
 
   if (initCan()) {
     Serial.println("CAN ready at 500 kbps");
   } else {
-    // Keep running so GPS NMEA still prints even with no OBD/CAN connection.
     Serial.println("CAN init failed - check wiring and CAN_CLOCK (8 vs 16 MHz)");
-    Serial.println("Continuing without OBD - GPS NMEA will still stream");
+    Serial.println("Continuing so the ELM327 adapter and dashboard still come up");
   }
 
   initGps();
   initWebDashboard();
+  if (waitForHotspot(ELM327_HOTSPOT_WAIT_MS)) {
+    Serial.println("Hotspot up — ELM327 on WiFi :35000");
+    elm327StartTcp();
+  } else {
+    Serial.println("No hotspot — switching to Bluetooth serial");
+    stopWifiRadio();
+    delay(300);
+    initElm327Bluetooth();
+  }
 }
 
 void loop() {
   handleWebDashboard();
   handleGps();
+  handleElm327();
 
-  if (gObdState.canReady) {
+  if (gObdState.canReady && !elm327ClientConnected()) {
     handlePendingCommands();
 
     for (size_t i = 0; i < kPidCount; i++) {

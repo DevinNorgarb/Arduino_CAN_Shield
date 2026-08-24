@@ -185,3 +185,100 @@ const char *scanStatusName() {
       return "idle";
   }
 }
+
+const char *ecuScanStatusName() {
+  switch (gObdState.ecuScanStatus) {
+    case SCAN_RUNNING:
+      return "scanning";
+    case SCAN_DONE:
+      return "done";
+    case SCAN_ERROR:
+      return "error";
+    default:
+      return "idle";
+  }
+}
+
+void decodeDtcPair(uint8_t a, uint8_t b, char *out) {
+  static const char kTypes[] = {'P', 'C', 'B', 'U'};
+  out[0] = kTypes[(a & 0xC0) >> 6];
+  out[1] = '0' + ((a & 0x30) >> 4);
+  const char *hex = "0123456789ABCDEF";
+  out[2] = hex[a & 0x0F];
+  out[3] = hex[(b & 0xF0) >> 4];
+  out[4] = hex[b & 0x0F];
+  out[5] = '\0';
+}
+
+void decodeUdsDtc(uint8_t a, uint8_t b, uint8_t c, char *out) {
+  decodeDtcPair(a, b, out);
+  const char *hex = "0123456789ABCDEF";
+  out[5] = '-';
+  out[6] = hex[(c & 0xF0) >> 4];
+  out[7] = hex[c & 0x0F];
+  out[8] = '\0';
+}
+
+void applyUdsDtcResponse(UdsModuleState &mod, const uint8_t *resp, int n) {
+  if (n < 3 || resp[0] != 0x59) {
+    mod.status = DTC_ERROR;
+    return;
+  }
+
+  uint8_t count = 0;
+  for (int i = 3; i + 3 < n && count < kMaxDtcs; i += 4) {
+    if (resp[i] == 0 && resp[i + 1] == 0 && resp[i + 2] == 0) {
+      continue;
+    }
+    decodeUdsDtc(resp[i], resp[i + 1], resp[i + 2], mod.dtcCodes[count]);
+    count++;
+  }
+
+  mod.dtcCount = count;
+  mod.status = DTC_DONE;
+}
+
+void sanitizeIdent(const uint8_t *data, uint8_t n, char *out, size_t outSize) {
+  if (outSize == 0) {
+    return;
+  }
+
+  uint8_t printable = 0;
+  uint8_t content = 0;
+  for (uint8_t i = 0; i < n; i++) {
+    if (data[i] == 0x00 || data[i] == 0x20 || data[i] == 0xFF) {
+      continue;
+    }
+    content++;
+    if (data[i] >= 0x20 && data[i] <= 0x7E && data[i] != '"' && data[i] != '\\') {
+      printable++;
+    }
+  }
+
+  size_t o = 0;
+  if (content > 0 && printable * 2 >= content) {
+    for (uint8_t i = 0; i < n && o + 1 < outSize; i++) {
+      const char c = static_cast<char>(data[i]);
+      if (c == 0x00 || c == 0xFF) {
+        continue;
+      }
+      if (c < 0x20 || c > 0x7E || c == '"' || c == '\\') {
+        continue;
+      }
+      out[o++] = c;
+    }
+    while (o > 0 && out[o - 1] == ' ') {
+      o--;
+    }
+  } else {
+    const char *hex = "0123456789ABCDEF";
+    for (uint8_t i = 0; i < n && o + 3 < outSize; i++) {
+      if (i > 0) {
+        out[o++] = ' ';
+      }
+      out[o++] = hex[(data[i] >> 4) & 0x0F];
+      out[o++] = hex[data[i] & 0x0F];
+    }
+  }
+  out[o] = '\0';
+}
