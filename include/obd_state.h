@@ -2,10 +2,15 @@
 
 #include <Arduino.h>
 
+#include "uds_modules.h"
+
 constexpr uint8_t kMaxDtcs = 16;
 constexpr uint8_t kDtcTextLen = 6;
-constexpr uint8_t kAbsDtcTextLen = 10;  // UDS "C1234-08" + null
+constexpr uint8_t kUdsDtcTextLen = 10;  // UDS "C1234-08" + null
 constexpr uint8_t kMaxSupportedPids = 224;
+constexpr uint8_t kMaxDidDump = 64;
+constexpr uint8_t kDidValueLen = 40;
+constexpr uint8_t kIdentLen = 24;
 
 enum DtcStatus : uint8_t {
   DTC_IDLE = 0,
@@ -20,6 +25,26 @@ enum ScanStatus : uint8_t {
   SCAN_RUNNING = 1,
   SCAN_DONE = 2,
   SCAN_ERROR = 3,
+};
+
+// Read/clear state for one UDS module (ABS, airbag, engine, ...).
+struct UdsModuleState {
+  char dtcCodes[kMaxDtcs][kUdsDtcTextLen] = {};
+  uint8_t dtcCount = 0;
+  uint8_t status = DTC_IDLE;
+  volatile bool cmdRead = false;
+  volatile bool cmdClear = false;
+  bool probed = false;
+  bool present = false;
+  char partNumber[kIdentLen] = {};
+  char swVersion[kIdentLen] = {};
+  char hwNumber[kIdentLen] = {};
+  char sysName[kIdentLen] = {};
+};
+
+struct DidDumpEntry {
+  uint16_t id = 0;
+  char value[kDidValueLen] = {};
 };
 
 struct ObdState {
@@ -58,14 +83,14 @@ struct ObdState {
   int16_t maxCoolantC = 0;
   int16_t maxBoostKpa = 0;
 
-  // GPS (u-blox NEO via UART/NMEA)
+  // GPS (u-blox NEO via UART/NMEA). Unused while ENABLE_GPS is 0.
   double latitude = 0;
   double longitude = 0;
   float gpsSpeedKmh = 0;
   float altitudeM = 0;
   float headingDeg = 0;
   uint8_t satellites = 0;
-  bool gpsValid = false;   // true once a position fix is available
+  bool gpsValid = false;  // true once a position fix is available
   uint32_t gpsLastFixMs = 0;
 
   // CAN status
@@ -83,23 +108,28 @@ struct ObdState {
   uint8_t dtcCount = 0;
   uint8_t dtcStatus = DTC_IDLE;
 
-  // ABS/ESP chassis codes (via UDS on the ABS module - not OBD)
-  char absDtcCodes[kMaxDtcs][kAbsDtcTextLen] = {};
-  uint8_t absDtcCount = 0;
-  uint8_t absStatus = DTC_IDLE;
+  // Non-OBD module codes (ABS, airbag, ...) read/cleared over UDS
+  UdsModuleState udsModules[UDS_MODULE_COUNT];
 
   // Supported-PID scan results (Mode 01 PID 0x00/0x20/...)
   uint8_t supportedPids[kMaxSupportedPids] = {};
   uint8_t supportedCount = 0;
   uint8_t pidScanStatus = SCAN_IDLE;
 
+  // Read-only UDS ECU scan + engine DID dump
+  uint8_t ecuScanStatus = SCAN_IDLE;
+  uint8_t ecuScanFound = 0;
+  char ecuScanLabel[32] = {};
+  char vin[18] = {};
+  DidDumpEntry engineDids[kMaxDidDump] = {};
+  uint8_t engineDidCount = 0;
+
   // Commands set by the web layer, consumed by the CAN loop
   volatile bool cmdResetPeaks = false;
   volatile bool cmdReadDtc = false;
   volatile bool cmdClearDtc = false;
   volatile bool cmdScanPids = false;
-  volatile bool cmdReadAbs = false;
-  volatile bool cmdClearAbs = false;
+  volatile bool cmdScanEcus = false;
 };
 
 extern ObdState gObdState;
@@ -111,5 +141,10 @@ void resetSessionPeaks();
 const char *canErrorName(uint8_t errorCode);
 const char *canStatusMessage();
 const char *dtcStatusName();
-const char *absStatusName();
+const char *dtcStatusText(uint8_t status);
 const char *scanStatusName();
+const char *ecuScanStatusName();
+void decodeDtcPair(uint8_t a, uint8_t b, char *out);
+void decodeUdsDtc(uint8_t a, uint8_t b, uint8_t c, char *out);
+void applyUdsDtcResponse(UdsModuleState &mod, const uint8_t *resp, int n);
+void sanitizeIdent(const uint8_t *data, uint8_t n, char *out, size_t outSize);

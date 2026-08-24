@@ -8,6 +8,7 @@
 #include "obd_state.h"
 #include "web_dashboard.h"
 #include "can_recorder.h"
+#include "elm327.h"
 
 namespace {
 
@@ -16,7 +17,7 @@ AsyncWebSocket ws("/ws");
 
 bool mdnsStarted = false;
 bool wifiWasConnected = false;
-uint32_t lastWifiAttemptMs = 0;
+bool wifiReleased = false;
 
 const char kDashboardHtml[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -68,6 +69,21 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     .pid code { color: #7dd3fc; font-family: ui-monospace, monospace; }
     .pid span { color: #cbd5e1; }
     .pid.known { border-color: #2f6d4a; }
+    .ecu-list { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .ecu {
+      background: #0f1830; border: 1px solid #24304d; border-radius: 8px;
+      padding: 10px 12px; display: grid; gap: 4px;
+    }
+    .ecu.present { border-color: #2f6d4a; }
+    .ecu.absent { opacity: 0.45; }
+    .ecu .eh { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+    .ecu .ea { color: #7dd3fc; font-family: ui-monospace, monospace; font-size: 0.85rem; }
+    .ecu .en { font-weight: 600; }
+    .ecu .es { font-size: 0.8rem; color: #4ade80; }
+    .ecu.absent .es { color: #64748b; }
+    .ecu .meta { font-size: 0.8rem; color: #94a3b8; font-family: ui-monospace, monospace; }
+    #ecu-vin { font-size: 1.15rem; word-break: break-all; }
+    .did-list { margin-top: 12px; display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px; }
     .status { font-size: 0.85rem; color: #94a3b8; }
     .connected { color: #4ade80; }
     .disconnected { color: #f87171; }
@@ -111,22 +127,19 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       <div class="card" id="battery-card"><div class="label">Battery</div><div class="value"><span id="battery">--</span> <span class="unit">V</span></div></div>
     </div>
 
-    <div class="section" id="gps-section">
+    <div class="section" id="elm-section">
       <div class="row">
-        <h2 style="margin:0">Location</h2>
+        <h2 style="margin:0">Phone OBD apps (ELM327)</h2>
         <div class="spacer"></div>
-        <a id="maps-link" href="#" target="_blank" rel="noopener" hidden><button class="primary">Open in Google Maps</button></a>
+        <span class="status" id="elm-status">Bluetooth starting…</span>
       </div>
+      <div class="status" style="margin-top:8px">Hotspot on this phone → WiFi adapter at the IP, port 35000. No hotspot at boot → Bluetooth <b>OBDII</b> PIN <b>1234</b> (Android). Never both (one radio).</div>
       <div class="grid" style="margin:12px 0 0">
-        <div class="card" id="gps-fix-card"><div class="label">GPS fix</div><div class="value" id="gps-fix">--</div></div>
-        <div class="card" id="sats-card"><div class="label">Satellites</div><div class="value" id="sats">--</div></div>
-        <div class="card" id="lat-card"><div class="label">Latitude</div><div class="value" id="lat">--</div></div>
-        <div class="card" id="lon-card"><div class="label">Longitude</div><div class="value" id="lon">--</div></div>
-        <div class="card" id="gps-speed-card"><div class="label">GPS speed</div><div class="value"><span id="gps-speed">--</span> <span class="unit">km/h</span></div></div>
-        <div class="card" id="alt-card"><div class="label">Altitude</div><div class="value"><span id="alt">--</span> <span class="unit">m</span></div></div>
-        <div class="card" id="heading-card"><div class="label">Heading</div><div class="value"><span id="heading">--</span> <span class="unit">°</span></div></div>
+        <div class="card" id="elm-name-card"><div class="label">Bluetooth name</div><div class="value" id="elm-name">OBDII</div></div>
+        <div class="card"><div class="label">PIN</div><div class="value" id="elm-pin">1234</div></div>
+        <div class="card" id="elm-ip-card"><div class="label">WiFi adapter</div><div class="value" id="elm-ip">--</div></div>
+        <div class="card" id="elm-conn-card"><div class="label">App linked</div><div class="value" id="elm-conn">No</div></div>
       </div>
-      <div class="chart" style="margin-top:16px"><div class="ct">Track (last 300 fixes)</div><svg id="track" viewBox="0 0 600 240" preserveAspectRatio="xMidYMid meet" style="width:100%;height:240px;background:#0b1120;border-radius:10px"></svg></div>
     </div>
 
     <div class="section">
@@ -176,6 +189,32 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
     <div class="section">
       <div class="row">
+        <h2 style="margin:0">Airbag / SRS</h2>
+        <div class="spacer"></div>
+        <button class="primary" id="read-airbag">Read codes</button>
+        <button class="danger" id="clear-airbag">Clear codes</button>
+      </div>
+      <div class="alert" style="margin:8px 0 0">⚠ Safety-critical. Reading is safe. Clearing only helps for soft/stored codes and will NOT clear an active fault or locked crash data — never rely on a cleared code to mean the airbag is functional. Disconnect the battery before working on SRS wiring.</div>
+      <div class="dtc-list" id="airbag-list"><div class="status">Press "Read codes" to scan the airbag module.</div></div>
+    </div>
+
+    <div class="section">
+      <div class="row">
+        <h2 style="margin:0">UDS ECU scan</h2>
+        <span id="ecu-count" class="status"></span>
+        <div class="spacer"></div>
+        <button class="primary" id="scan-ecus">Scan ECUs</button>
+      </div>
+      <div class="status" style="margin-top:8px">Read-only. Probes each VAG module through the gateway, then dumps engine identification DIDs (0xF180–0xF1FF). No coding, no security access, no writes.</div>
+      <div class="grid" style="margin:12px 0 0">
+        <div class="card"><div class="label">VIN</div><div class="value" id="ecu-vin">--</div></div>
+      </div>
+      <div class="ecu-list" id="ecu-list"><div class="status">Press "Scan ECUs" with ignition ON.</div></div>
+      <div class="did-list" id="did-list"></div>
+    </div>
+
+    <div class="section">
+      <div class="row">
         <h2 style="margin:0">Supported PIDs</h2>
         <span id="pid-count" class="status"></span>
         <div class="spacer"></div>
@@ -197,20 +236,12 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       </details>
     </div>
 
-    <div class="section">
-      <details class="nmea" id="nmea-details">
-        <summary>Raw GPS NMEA <span class="count" id="nmea-count"></span></summary>
-        <div class="nmea-log" id="nmea-log"><span class="nmea-empty">Waiting for NMEA sentences…</span></div>
-      </details>
-    </div>
-
     <div class="status disconnected" id="status">Connecting...</div>
   </main>
 
   <script>
     const RPM_MAX = 7000, SPEED_MAX = 220, BOOST_MIN = -100, BOOST_MAX = 150;
     const rpmHist = [], speedHist = [], HIST = 120;
-    const track = [], TRACK_MAX = 300;
 
     function arcGauge(elId, value, max, valueText, label, unit, color) {
       const frac = Math.max(0, Math.min(1, value / max));
@@ -251,39 +282,6 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
         `<path d="${d}" fill="none" stroke="${color}" stroke-width="2.5"/>`;
     }
 
-    function drawTrack() {
-      const svg = document.getElementById('track');
-      if (track.length < 2) {
-        svg.innerHTML = '<text x="300" y="120" text-anchor="middle" fill="#64748b" font-size="14">Waiting for GPS fix…</text>';
-        return;
-      }
-      const W = 600, H = 240, pad = 16;
-      let minLat = Infinity, maxLat = -Infinity, minLon = Infinity, maxLon = -Infinity;
-      for (const [la, lo] of track) {
-        if (la < minLat) minLat = la; if (la > maxLat) maxLat = la;
-        if (lo < minLon) minLon = lo; if (lo > maxLon) maxLon = lo;
-      }
-      // Keep geographic aspect roughly correct (lon compresses toward the poles).
-      const midLat = (minLat + maxLat) / 2;
-      const spanLat = Math.max(maxLat - minLat, 1e-5);
-      const spanLon = Math.max((maxLon - minLon) * Math.cos(midLat * Math.PI / 180), 1e-5);
-      const scale = Math.min((W - 2 * pad) / spanLon, (H - 2 * pad) / spanLat);
-      function proj(la, lo) {
-        const x = pad + ((lo - minLon) * Math.cos(midLat * Math.PI / 180)) * scale;
-        const y = H - pad - (la - minLat) * scale;
-        return [x, y];
-      }
-      let d = '';
-      track.forEach(([la, lo], i) => {
-        const [x, y] = proj(la, lo);
-        d += (i === 0 ? 'M' : 'L') + x.toFixed(1) + ' ' + y.toFixed(1) + ' ';
-      });
-      const [cx, cy] = proj(track[track.length - 1][0], track[track.length - 1][1]);
-      svg.innerHTML =
-        `<path d="${d}" fill="none" stroke="#38bdf8" stroke-width="2.5" stroke-linejoin="round"/>` +
-        `<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="5" fill="#f87171"/>`;
-    }
-
     function setText(id, text, cardId, valid) {
       document.getElementById(id).textContent = text;
       if (cardId) document.getElementById(cardId).classList.toggle('stale', !valid);
@@ -317,12 +315,16 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       drawChart('chart-rpm', rpmHist, RPM_MAX, '#38bdf8');
       drawChart('chart-speed', speedHist, SPEED_MAX, '#4ade80');
 
-      renderGps(data);
+      renderElm(data);
       renderDtc(data);
+      renderEcus(data);
       renderPids(data);
 
       const alert = document.getElementById('alert');
-      if (data.can_ok && data.rpm_valid) {
+      if (data.elm_connected) {
+        alert.hidden = false;
+        alert.textContent = 'Phone OBD app owns the CAN bus — dashboard polling is paused.';
+      } else if (data.can_ok && data.rpm_valid) {
         alert.hidden = true;
       } else {
         alert.hidden = false;
@@ -336,29 +338,29 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       status.className = 'status connected';
     }
 
-    function renderGps(data) {
-      const fix = !!data.gps_valid;
-      setText('gps-fix', fix ? 'Locked' : 'No fix', 'gps-fix-card', fix);
-      setText('sats', data.gps_sats != null ? data.gps_sats : '--', 'sats-card', data.gps_sats > 0);
-      setText('lat', fix ? data.lat.toFixed(6) : '--', 'lat-card', fix);
-      setText('lon', fix ? data.lon.toFixed(6) : '--', 'lon-card', fix);
-      setText('gps-speed', fix ? data.gps_speed_kmh.toFixed(1) : '--', 'gps-speed-card', fix);
-      setText('alt', fix ? data.gps_alt_m : '--', 'alt-card', fix);
-      setText('heading', fix ? data.gps_heading : '--', 'heading-card', fix);
-
-      const link = document.getElementById('maps-link');
-      if (fix) {
-        link.href = 'https://www.google.com/maps?q=' + data.lat.toFixed(6) + ',' + data.lon.toFixed(6);
-        link.hidden = false;
-        const last = track[track.length - 1];
-        if (!last || last[0] !== data.lat || last[1] !== data.lon) {
-          track.push([data.lat, data.lon]);
-          if (track.length > TRACK_MAX) track.shift();
-        }
+    function renderElm(data) {
+      const bt = data.elm_transport === 'bluetooth';
+      setText('elm-name', data.elm_bt_name || 'OBDII', 'elm-name-card', bt);
+      setText('elm-pin', data.elm_bt_pin || '1234');
+      const ip = data.ip || '';
+      setText('elm-ip', (!bt && ip && ip !== '0.0.0.0') ? (ip + ':' + (data.elm_port || 35000)) : '--',
+        'elm-ip-card', !bt && !!ip && ip !== '0.0.0.0');
+      const linked = !!data.elm_connected;
+      setText('elm-conn', linked ? 'Yes' : 'No', 'elm-conn-card', linked);
+      const st = document.getElementById('elm-status');
+      if (linked) {
+        st.textContent = 'App connected';
+        st.className = 'status connected';
+      } else if (bt) {
+        st.textContent = 'Bluetooth OBDII PIN ' + (data.elm_bt_pin || '1234');
+        st.className = 'status connected';
+      } else if (ip && ip !== '0.0.0.0') {
+        st.textContent = 'WiFi ' + ip + ':' + (data.elm_port || 35000);
+        st.className = 'status connected';
       } else {
-        link.hidden = true;
+        st.textContent = 'Waiting for hotspot…';
+        st.className = 'status disconnected';
       }
-      drawTrack();
     }
 
     const PID_NAMES = {
@@ -381,6 +383,65 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       0xA0: 'PIDs supported A1-C0', 0xC0: 'PIDs supported C1-E0', 0x00: 'PIDs supported 01-20'
     };
     function hex2(n) { return '0x' + n.toString(16).toUpperCase().padStart(2, '0'); }
+    function hex4(n) { return n.toString(16).toUpperCase().padStart(4, '0'); }
+
+    const DID_NAMES = {
+      0xF180: 'Boot software ident', 0xF181: 'Application software ident',
+      0xF182: 'Application data ident', 0xF186: 'Active diagnostic session',
+      0xF187: 'Spare part number', 0xF188: 'VW ECU ident', 0xF189: 'Software version',
+      0xF18A: 'System supplier ident', 0xF18C: 'ECU serial number', 0xF190: 'VIN',
+      0xF191: 'Hardware number', 0xF194: 'Hardware version', 0xF195: 'Software version (alt)',
+      0xF197: 'System name', 0xF19E: 'ASAM/ODX file ident', 0xF1A0: 'Workshop system name',
+      0xF1A2: 'ASAM/ODX file version', 0xF1AA: 'Workshop system name', 0xF1DF: 'Engine/serial ident'
+    };
+
+    function renderEcus(data) {
+      const list = document.getElementById('ecu-list');
+      const count = document.getElementById('ecu-count');
+      const vinEl = document.getElementById('ecu-vin');
+      const didList = document.getElementById('did-list');
+      vinEl.textContent = data.vin || '--';
+      if (data.ecu_scan_status === 'idle') return;
+      if (data.ecu_scan_status === 'scanning') {
+        count.textContent = data.ecu_scan_label || 'Scanning…';
+      } else if (data.ecu_scan_status === 'error') {
+        count.textContent = 'Scan failed';
+      } else {
+        count.textContent = (data.ecu_scan_found || 0) + ' present';
+      }
+      const ecus = data.ecus || [];
+      if (!ecus.length) {
+        list.innerHTML = '<div class="status">Scanning…</div>';
+      } else {
+        list.innerHTML = ecus.map(e => {
+          const state = !e.probed ? 'pending' : (e.present ? 'present' : 'absent');
+          const badge = !e.probed ? '…' : (e.present ? 'present' : 'absent');
+          const bits = [];
+          if (e.part) bits.push(e.part);
+          if (e.sw) bits.push('SW ' + e.sw);
+          if (e.hw) bits.push('HW ' + e.hw);
+          if (e.sys) bits.push(e.sys);
+          bits.push(e.req + '/' + e.resp);
+          if (e.present && e.dtc_count) bits.push(e.dtc_count + ' DTC');
+          const dtcs = (e.present && e.dtcs && e.dtcs.length)
+            ? e.dtcs.map(c => '<div class="dtc">' + c + '</div>').join('') : '';
+          return '<div class="ecu ' + state + '"><div class="eh"><span class="ea">' + e.addr +
+            '</span><span class="en">' + e.name + '</span><span class="es">' + badge +
+            '</span></div><div class="meta">' + bits.join(' · ') + '</div>' + dtcs + '</div>';
+        }).join('');
+      }
+      const dids = data.engine_dids || [];
+      if (!dids.length) {
+        didList.innerHTML = (data.ecu_scan_status === 'done')
+          ? '<div class="status">No engine identification DIDs returned.</div>' : '';
+        return;
+      }
+      didList.innerHTML = dids.map(d => {
+        const name = DID_NAMES[d.id] || 'Data identifier';
+        return '<div class="pid known"><code>' + hex4(d.id) + '</code><span>' + name +
+          ' — ' + (d.value || '') + '</span></div>';
+      }).join('');
+    }
 
     function renderPids(data) {
       const list = document.getElementById('pid-list');
@@ -415,19 +476,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     function renderDtc(data) {
       renderCodes('dtc-list', data.dtc_status, data.dtcs);
       renderCodes('abs-list', data.abs_status, data.abs_dtcs);
-    }
-
-    const nmeaLines = [], NMEA_MAX = 200;
-    let nmeaSeen = 0;
-    function appendNmea(line) {
-      nmeaLines.push(line);
-      if (nmeaLines.length > NMEA_MAX) nmeaLines.shift();
-      nmeaSeen++;
-      document.getElementById('nmea-count').textContent = '(' + nmeaSeen + ')';
-      const log = document.getElementById('nmea-log');
-      const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 30;
-      log.textContent = nmeaLines.join('\n');
-      if (atBottom) log.scrollTop = log.scrollHeight;
+      renderCodes('airbag-list', data.airbag_status, data.airbag_dtcs);
     }
 
     const canLines = [], CAN_VIEW_MAX = 300;
@@ -453,6 +502,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
 
     document.getElementById('reset-peaks').onclick = () => send('reset_peaks');
     document.getElementById('scan-pids').onclick = () => send('scan_pids');
+    document.getElementById('scan-ecus').onclick = () => send('scan_ecus');
     document.getElementById('read-dtc').onclick = () => send('read_dtc');
     document.getElementById('clear-dtc').onclick = () => {
       if (confirm('Clear all stored trouble codes and turn off the check-engine light?')) send('clear_dtc');
@@ -460,6 +510,10 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     document.getElementById('read-abs').onclick = () => send('read_abs');
     document.getElementById('clear-abs').onclick = () => {
       if (confirm('Clear stored ABS/ESP codes? This will not help if the fault is currently active.')) send('clear_abs');
+    };
+    document.getElementById('read-airbag').onclick = () => send('read_airbag');
+    document.getElementById('clear-airbag').onclick = () => {
+      if (confirm('SAFETY: Clearing airbag/SRS codes will NOT fix an active fault or crash data, and a cleared code does not mean the airbag will deploy. Only proceed for a known soft code. Continue?')) send('clear_airbag');
     };
     document.getElementById('rec-toggle').onclick = () => {
       canRecording = !canRecording;
@@ -492,7 +546,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       };
       socket.onmessage = (event) => {
         const data = JSON.parse(event.data);
-        if (data.nmea !== undefined) { appendNmea(data.nmea); return; }
+        if (data.nmea !== undefined) { return; }
         if (data.can !== undefined) { appendCan(data.can); return; }
         if (typeof data.rec_active === 'boolean' && data.rec_active !== canRecording) {
           canRecording = data.rec_active;
@@ -560,13 +614,17 @@ String buildObdJson() {
   }
   json += "],";
 
-  json += "\"abs_status\":\"" + String(absStatusName()) + "\",";
-  json += "\"abs_dtcs\":[";
-  for (uint8_t i = 0; i < gObdState.absDtcCount; i++) {
-    if (i > 0) json += ",";
-    json += "\"" + String(gObdState.absDtcCodes[i]) + "\"";
+  for (uint8_t m = 0; m < UDS_MODULE_COUNT; m++) {
+    const UdsModuleState &mod = gObdState.udsModules[m];
+    const String key = kUdsModules[m].key;
+    json += "\"" + key + "_status\":\"" + String(dtcStatusText(mod.status)) + "\",";
+    json += "\"" + key + "_dtcs\":[";
+    for (uint8_t i = 0; i < mod.dtcCount; i++) {
+      if (i > 0) json += ",";
+      json += "\"" + String(mod.dtcCodes[i]) + "\"";
+    }
+    json += "],";
   }
-  json += "],";
 
   json += "\"pid_scan_status\":\"" + String(scanStatusName()) + "\",";
   json += "\"supported_count\":" + String(gObdState.supportedCount) + ",";
@@ -576,6 +634,54 @@ String buildObdJson() {
     json += String(gObdState.supportedPids[i]);
   }
   json += "],";
+
+  json += "\"ecu_scan_status\":\"" + String(ecuScanStatusName()) + "\",";
+  json += "\"ecu_scan_label\":\"" + String(gObdState.ecuScanLabel) + "\",";
+  json += "\"ecu_scan_found\":" + String(gObdState.ecuScanFound) + ",";
+  json += "\"vin\":\"" + String(gObdState.vin) + "\",";
+  json += "\"ecus\":[";
+  for (uint8_t i = 0; i < UDS_MODULE_COUNT; i++) {
+    const UdsModuleConfig &cfg = kUdsModules[i];
+    const UdsModuleState &mod = gObdState.udsModules[i];
+    if (i > 0) json += ",";
+    char addr[3], req[8], resp[8];
+    snprintf(addr, sizeof(addr), "%02X", cfg.vagAddr);
+    snprintf(req, sizeof(req), "%03lX", cfg.reqId);
+    snprintf(resp, sizeof(resp), "%03lX", cfg.respId);
+    json += "{\"key\":\"" + String(cfg.key) + "\",";
+    json += "\"addr\":\"" + String(addr) + "\",";
+    json += "\"name\":\"" + String(cfg.name) + "\",";
+    json += "\"req\":\"" + String(req) + "\",";
+    json += "\"resp\":\"" + String(resp) + "\",";
+    json += "\"probed\":" + boolStr(mod.probed) + ",";
+    json += "\"present\":" + boolStr(mod.present) + ",";
+    json += "\"part\":\"" + String(mod.partNumber) + "\",";
+    json += "\"sw\":\"" + String(mod.swVersion) + "\",";
+    json += "\"hw\":\"" + String(mod.hwNumber) + "\",";
+    json += "\"sys\":\"" + String(mod.sysName) + "\",";
+    json += "\"dtc_count\":" + String(mod.dtcCount) + ",";
+    json += "\"dtcs\":[";
+    for (uint8_t d = 0; d < mod.dtcCount; d++) {
+      if (d > 0) json += ",";
+      json += "\"" + String(mod.dtcCodes[d]) + "\"";
+    }
+    json += "]}";
+  }
+  json += "],";
+  json += "\"engine_dids\":[";
+  for (uint8_t i = 0; i < gObdState.engineDidCount; i++) {
+    if (i > 0) json += ",";
+    json += "{\"id\":" + String(gObdState.engineDids[i].id) + ",";
+    json += "\"value\":\"" + String(gObdState.engineDids[i].value) + "\"}";
+  }
+  json += "],";
+
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"elm_bt_name\":\"" + String(ELM327_BT_NAME) + "\",";
+  json += "\"elm_bt_pin\":\"" + String(ELM327_BT_PIN) + "\",";
+  json += "\"elm_port\":" + String(ELM327_TCP_PORT) + ",";
+  json += "\"elm_transport\":\"" + String(elm327UsingBluetooth() ? "bluetooth" : "wifi") + "\",";
+  json += "\"elm_connected\":" + boolStr(elm327ClientConnected()) + ",";
 
   json += "\"gps_valid\":" + boolStr(gObdState.gpsValid) + ",";
   json += "\"lat\":" + String(gObdState.latitude, 6) + ",";
@@ -605,14 +711,27 @@ void handleWsCommand(const String &cmd) {
     gObdState.cmdClearDtc = true;
   } else if (cmd == "scan_pids") {
     gObdState.cmdScanPids = true;
-  } else if (cmd == "read_abs") {
-    gObdState.cmdReadAbs = true;
-  } else if (cmd == "clear_abs") {
-    gObdState.cmdClearAbs = true;
+  } else if (cmd == "scan_ecus") {
+    if (gObdState.ecuScanStatus != SCAN_RUNNING) {
+      gObdState.cmdScanEcus = true;
+    }
   } else if (cmd == "rec_start") {
     canRecordStart();
   } else if (cmd == "rec_stop") {
     canRecordStop();
+  } else {
+    // UDS module commands: read_<key> / clear_<key> (e.g. read_abs, clear_airbag)
+    for (uint8_t i = 0; i < UDS_MODULE_COUNT; i++) {
+      const String key = kUdsModules[i].key;
+      if (cmd == "read_" + key) {
+        gObdState.udsModules[i].cmdRead = true;
+        return;
+      }
+      if (cmd == "clear_" + key) {
+        gObdState.udsModules[i].cmdClear = true;
+        return;
+      }
+    }
   }
 }
 
@@ -648,6 +767,7 @@ void startMdns() {
 
   if (MDNS.begin(MDNS_HOSTNAME)) {
     MDNS.addService("http", "tcp", 80);
+    MDNS.addService("obd", "tcp", ELM327_TCP_PORT);
     mdnsStarted = true;
     Serial.printf("Dashboard shortcut: http://%s.local\n", MDNS_HOSTNAME);
   }
@@ -657,10 +777,14 @@ void onWiFiConnected() {
   Serial.print("Phone hotspot connected, dashboard at http://");
   Serial.print(WiFi.localIP());
   Serial.printf(" or http://%s.local\n", MDNS_HOSTNAME);
+  elm327OnWifiUp();
   startMdns();
 }
 
 void maintainWiFi() {
+  if (wifiReleased) {
+    return;
+  }
   const wl_status_t status = WiFi.status();
 
   if (status == WL_CONNECTED) {
@@ -672,25 +796,20 @@ void maintainWiFi() {
   }
 
   if (wifiWasConnected) {
-    Serial.println("Phone hotspot lost - retrying...");
+    Serial.println("Phone hotspot lost — auto-reconnect (not calling WiFi.begin again)");
     wifiWasConnected = false;
     mdnsStarted = false;
   }
-
-  const uint32_t now = millis();
-  if ((now - lastWifiAttemptMs) < 10000) {
-    return;
-  }
-
-  lastWifiAttemptMs = now;
-  Serial.println("Reconnecting to phone hotspot...");
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  // setAutoReconnect(true) already retries. Calling WiFi.begin() while STA is
+  // connecting overflows the WiFi event queue and panics Bluedroid
+  // (hash_map_set data != NULL) when Classic BT is also running.
 }
 
 }  // namespace
 
 void initWebDashboard() {
   WiFi.mode(WIFI_STA);
+  WiFi.setSleep(WIFI_PS_MIN_MODEM);
   WiFi.setAutoReconnect(true);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
@@ -709,8 +828,34 @@ void initWebDashboard() {
 }
 
 void handleWebDashboard() {
+  if (wifiReleased) {
+    return;
+  }
   maintainWiFi();
   ws.cleanupClients();
+}
+
+bool waitForHotspot(uint32_t timeoutMs) {
+  const uint32_t deadline = millis() + timeoutMs;
+  while ((int32_t)(deadline - millis()) > 0) {
+    handleWebDashboard();
+    if (WiFi.status() == WL_CONNECTED) {
+      return true;
+    }
+    delay(50);
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void stopWifiRadio() {
+  wifiReleased = true;
+  WiFi.setAutoReconnect(false);
+  ws.closeAll();
+  server.end();
+  WiFi.disconnect(true, false);
+  delay(50);
+  WiFi.mode(WIFI_OFF);
+  Serial.println("WiFi off — radio free for Bluetooth serial");
 }
 
 void broadcastObdState() {
