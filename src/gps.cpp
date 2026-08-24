@@ -1,11 +1,15 @@
 #include <Arduino.h>
+
+#include "config.h"
+#include "gps.h"
+
+#if ENABLE_GPS
+
 #include <HardwareSerial.h>
 #include <TinyGPSPlus.h>
 
-#include "config.h"
 #include "obd_state.h"
 #include "web_dashboard.h"
-#include "gps.h"
 
 namespace {
 
@@ -94,3 +98,11 @@ void handleGps() {
     broadcastObdState();
   }
 }
+
+#else
+
+void initGps() { Serial.println("GPS disabled (ENABLE_GPS=0)"); }
+
+void handleGps() {}
+
+#endif

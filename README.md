@@ -21,10 +21,10 @@ Phone (hotspot + cellular) ←→ NodeMCU-32S ←→ OBD port
 
 1. On your phone: enable hotspot and note the network name + password.
 2. Put those in `include/config.h` and upload firmware.
-3. In the car: turn on hotspot, plug in the NodeMCU, wait ~10 seconds.
+3. In the car: turn on hotspot **before** plugging in the NodeMCU, wait ~15 seconds.
 4. On your phone browser: open **http://obd.local** (or the IP from serial monitor).
 
-The ESP32 retries the hotspot automatically if you turn it on after starting the car.
+If the hotspot is missing at boot, WiFi is turned off and Bluetooth serial **OBDII** (PIN 1234) starts instead. Reboot with the hotspot on to get the dashboard back.
 
 **Tip:** bookmark `http://obd.local` on your phone. Hotspot drains battery faster — keep the phone plugged in on long drives.
 
@@ -41,6 +41,20 @@ The ESP32 retries the hotspot automatically if you turn it on after starting the
 | MOSI (SI)      | D23         | |
 | CS             | D5          | |
 | INT            | D4          | |
+
+### ESP32-DOIT-DevKit-V1 ↔ MCP2515 (SPI side)
+
+Same GPIOs as the NodeMCU. Use this board if the NodeMCU **5V / VIN** pin is dead. Default PlatformIO env: `esp32doit-devkit-v1`.
+
+| MCP2515 module | DOIT DevKit V1 | Notes |
+|----------------|----------------|-------|
+| VCC            | **5V**         | Not 3V3. On 30-pin boards with no `5V` label, use **VIN** (USB 5V). |
+| GND            | GND            | |
+| SCK            | **18**         | |
+| MISO (SO)      | **19**         | |
+| MOSI (SI)      | **23**         | |
+| CS             | **5**          | |
+| INT            | **4**          | |
 
 ### MCP2515 ↔ OBD-II port (CAN bus side)
 
@@ -71,11 +85,13 @@ Set your **phone hotspot** credentials before uploading:
 ## Build and upload
 
 ```bash
-pio run -e nodemcu-32s -t upload
-pio device monitor -e nodemcu-32s
+pio run -e esp32doit-devkit-v1 -t upload
+pio device monitor -e esp32doit-devkit-v1
 ```
 
-If upload fails, hold the **BOOT** button on the NodeMCU-32S while connecting, or press BOOT when the terminal shows "Connecting...".
+NodeMCU-32S: `pio run -e nodemcu-32s -t upload`.
+
+If upload fails, hold **BOOT** while connecting, or press BOOT when the terminal shows "Connecting...".
 
 ## Web dashboard
 
@@ -88,6 +104,21 @@ http://obd.local
 If that doesn't resolve on your phone, check the serial monitor for the IP (often `192.168.43.x` on Android or `172.20.10.x` on iPhone hotspot).
 
 Live OBD data is pushed over WebSocket (`/ws`) whenever a new reading arrives.
+
+## Phone OBD apps (ELM327)
+
+One radio, one transport — chosen at boot:
+
+- **Hotspot on** within ~15s → WiFi ELM327 at `<ESP32-IP>:35000` (dashboard too).
+- **No hotspot** → WiFi is powered off, then Bluetooth serial **OBDII** / PIN **1234** (Android).
+
+They are never on together (Classic BT + WiFi crashes this ESP32). Reboot with the hotspot on or off to switch.
+
+**WiFi (iPhone or Android):** Car Scanner → WiFi adapter → host = dashboard IP, port **35000**.
+
+**Bluetooth (Android only):** Settings → Bluetooth → **OBDII**, PIN **1234**. iPhone cannot use SPP.
+
+GPS (u-blox NEO on UART2) is still in the firmware but **disabled** (`ENABLE_GPS 0` in `include/config.h`). Set that to `1` to bring it back.
 
 ## Serial output
 
@@ -145,7 +176,7 @@ Turn your recording into the simulator's response table, then flash it:
 ```bash
 python scripts/log_to_header.py capture.log   # -> src/ecu_sim/recorded_responses.h
 pio run -e esp32-ecu-sim -t upload            # flash the SECOND ESP32
-pio run -e nodemcu-32s -t upload              # flash the main board (unchanged)
+pio run -e esp32doit-devkit-v1 -t upload      # flash the main board (unchanged)
 ```
 
 The simulator listens for the main board's OBD requests and replays the real
@@ -163,4 +194,4 @@ default, so `esp32-ecu-sim` builds and runs even before you've recorded anything
 
 ## Vehicle notes
 
-- **VW Polo 2018 (MQB)**: Standard ISO 15765-4 CAN at 500 kbps, 11-bit IDs (request `0x7DF`, response `0x7E8`) — the default config works. Ignition must be fully ON (dash lit) or engine running; the gateway sleeps otherwise.
+- **VW Polo 2018 (MQB-A0)**: ISO 15765-4 CAN at 500 kbps, 11-bit IDs. Generic OBD uses `0x7DF`/`0x7E8`. The dashboard **UDS ECU scan** probes physical addresses (engine `0x7E0`, ABS `0x713`, airbag `0x715`, …) read-only — identity, DTCs, and engine DIDs `0xF180–0xF1FF`. Ignition must be fully ON (dash lit) or engine running; the gateway sleeps otherwise.
