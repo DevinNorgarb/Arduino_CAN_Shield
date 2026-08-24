@@ -575,7 +575,9 @@ String buildObdJson() {
   const uint32_t ageMs =
       gObdState.lastUpdateMs == 0 ? 0 : millis() - gObdState.lastUpdateMs;
 
-  String json = "{";
+  String json;
+  json.reserve(4096);
+  json += "{";
   json += "\"rpm\":" + String(gObdState.rpm, 1) + ",";
   json += "\"speed_kmh\":" + String(gObdState.speedKmh) + ",";
   json += "\"coolant_c\":" + String(gObdState.coolantC) + ",";
@@ -668,11 +670,15 @@ String buildObdJson() {
     json += "]}";
   }
   json += "],";
+  // Skip the growing DID dump while a scan is in progress — progress updates
+  // stay small; the final "done" broadcast carries the full list.
   json += "\"engine_dids\":[";
-  for (uint8_t i = 0; i < gObdState.engineDidCount; i++) {
-    if (i > 0) json += ",";
-    json += "{\"id\":" + String(gObdState.engineDids[i].id) + ",";
-    json += "\"value\":\"" + String(gObdState.engineDids[i].value) + "\"}";
+  if (gObdState.ecuScanStatus != SCAN_RUNNING) {
+    for (uint8_t i = 0; i < gObdState.engineDidCount; i++) {
+      if (i > 0) json += ",";
+      json += "{\"id\":" + String(gObdState.engineDids[i].id) + ",";
+      json += "\"value\":\"" + String(gObdState.engineDids[i].value) + "\"}";
+    }
   }
   json += "],";
 
@@ -858,13 +864,27 @@ void stopWifiRadio() {
   Serial.println("WiFi off — radio free for Bluetooth serial");
 }
 
-void broadcastObdState() {
+void broadcastObdState(bool force) {
   if (ws.count() == 0) {
     return;
   }
 
+  static uint32_t lastBroadcastMs = 0;
+  const uint32_t now = millis();
+  if (!force && (now - lastBroadcastMs) < 200) {
+    return;
+  }
+  lastBroadcastMs = now;
+
   const String json = buildObdJson();
-  ws.textAll(json);
+
+  // textAll() will queue forever / disconnect clients when the TCP send buffer
+  // is full (common on phone hotspots). Only push to clients that can accept.
+  for (AsyncWebSocketClient &client : ws.getClients()) {
+    if (client.status() == WS_CONNECTED && client.canSend()) {
+      client.text(json);
+    }
+  }
 }
 
 void broadcastNmea(const String &line) {
@@ -881,7 +901,11 @@ void broadcastNmea(const String &line) {
     json += c;
   }
   json += "\"}";
-  ws.textAll(json);
+  for (AsyncWebSocketClient &client : ws.getClients()) {
+    if (client.status() == WS_CONNECTED && client.canSend()) {
+      client.text(json);
+    }
+  }
 }
 
 void broadcastCanFrame(const String &line) {
@@ -894,5 +918,9 @@ void broadcastCanFrame(const String &line) {
   String json = "{\"can\":\"";
   json += line;
   json += "\"}";
-  ws.textAll(json);
+  for (AsyncWebSocketClient &client : ws.getClients()) {
+    if (client.status() == WS_CONNECTED && client.canSend()) {
+      client.text(json);
+    }
+  }
 }

@@ -140,6 +140,8 @@ bool waitForObdResponse(uint8_t expectedPid, uint8_t *response, uint8_t &length,
 
   while ((int32_t)(deadline - millis()) > 0) {
     if (canBus.checkReceive() != CAN_MSGAVAIL) {
+      yield();
+      delay(1);
       continue;
     }
 
@@ -245,6 +247,8 @@ int readDtcResponse(uint8_t *buf, size_t bufSize) {
 
   while ((int32_t)(deadline - millis()) > 0) {
     if (canBus.checkReceive() != CAN_MSGAVAIL) {
+      yield();
+      delay(1);
       continue;
     }
 
@@ -354,6 +358,8 @@ void performDtcClear() {
   const uint32_t deadline = millis() + 500;
   while ((int32_t)(deadline - millis()) > 0) {
     if (canBus.checkReceive() != CAN_MSGAVAIL) {
+      yield();
+      delay(1);
       continue;
     }
     unsigned long rxId = 0;
@@ -515,6 +521,6 @@ void loop() {
   const uint32_t now = millis();
   if ((now - gObdState.lastStatusBroadcastMs) >= 2000) {
     gObdState.lastStatusBroadcastMs = now;
-    broadcastObdState();
+    broadcastObdState(true);
   }
 }

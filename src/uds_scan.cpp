@@ -21,9 +21,14 @@ void setScanLabel(const char *text) {
   gObdState.ecuScanLabel[sizeof(gObdState.ecuScanLabel) - 1] = '\0';
 }
 
-void pumpScan() {
+void pumpScan(bool forceBroadcast = false) {
   handleWebDashboard();
-  broadcastObdState();
+  static uint32_t lastBroadcastMs = 0;
+  const uint32_t now = millis();
+  if (forceBroadcast || (now - lastBroadcastMs) >= 500) {
+    lastBroadcastMs = now;
+    broadcastObdState(true);
+  }
   yield();
 }
 
@@ -164,10 +169,10 @@ void performUdsRead(uint8_t moduleId) {
 
   mod.status = DTC_READING;
   mod.dtcCount = 0;
-  broadcastObdState();
+  broadcastObdState(true);
   readModuleDtcs(moduleId);
   Serial.printf("%s: read %u DTC(s)\n", cfg.key, mod.dtcCount);
-  broadcastObdState();
+  broadcastObdState(true);
 }
 
 void performUdsClear(uint8_t moduleId) {
@@ -175,7 +180,7 @@ void performUdsClear(uint8_t moduleId) {
   UdsModuleState &mod = gObdState.udsModules[moduleId];
 
   mod.status = DTC_READING;
-  broadcastObdState();
+  broadcastObdState(true);
 
   const uint8_t session[] = {0x10, 0x03};
   uint8_t scratch[16] = {};
@@ -194,7 +199,7 @@ void performUdsClear(uint8_t moduleId) {
   } else {
     mod.status = DTC_ERROR;
   }
-  broadcastObdState();
+  broadcastObdState(true);
 }
 
 void performEcuScan() {
@@ -214,14 +219,14 @@ void performEcuScan() {
     mod.hwNumber[0] = '\0';
     mod.sysName[0] = '\0';
   }
-  pumpScan();
+  pumpScan(true);
 
   for (uint8_t i = 0; i < UDS_MODULE_COUNT; i++) {
     const UdsModuleConfig &cfg = kUdsModules[i];
     UdsModuleState &mod = gObdState.udsModules[i];
     snprintf(gObdState.ecuScanLabel, sizeof(gObdState.ecuScanLabel), "%02X %s",
              cfg.vagAddr, cfg.name);
-    pumpScan();
+    pumpScan(true);
 
     const bool present = probeModule(cfg);
     mod.probed = true;
@@ -242,7 +247,7 @@ void performEcuScan() {
 
   if (gObdState.udsModules[UDS_MOD_ENGINE].present) {
     setScanLabel("Engine DID dump");
-    pumpScan();
+    pumpScan(true);
     dumpEngineDids();
   }
 
@@ -252,5 +257,5 @@ void performEcuScan() {
            gObdState.ecuScanFound, gObdState.ecuScanFound == 1 ? "" : "s");
   Serial.printf("ECU scan complete: %u present, %u engine DIDs\n", gObdState.ecuScanFound,
                 gObdState.engineDidCount);
-  broadcastObdState();
+  broadcastObdState(true);
 }
