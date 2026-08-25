@@ -1,0 +1,45 @@
+services:
+  can-stream:
+    build:
+      context: .
+      dockerfile: docker/can-stream/Dockerfile
+    image: can-stream:local
+    ports:
+      - "${CAN_STREAM_PORT:-8765}:8765"
+    environment:
+      CAN_STREAM_HOST: "0.0.0.0"
+      CAN_STREAM_PORT: "8765"
+      CAN_STREAM_OUT: /data/capture.ndjson
+    volumes:
+      - ./can-stream-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/', timeout=2)",
+        ]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - can-stream
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./docker/can-stream/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:

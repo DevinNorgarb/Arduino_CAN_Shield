@@ -608,6 +608,18 @@ void elm327StopTcp() {
   elmTcpServer.end();
 }
 
+void elm327StopBluetooth() {
+  if (!elmBluetoothActive) {
+    return;
+  }
+  if (SerialBT.hasClient()) {
+    SerialBT.disconnect();
+  }
+  SerialBT.end();
+  elmBluetoothActive = false;
+  Serial.println("ELM327 Bluetooth stopped");
+}
+
 void elm327OnWifiUp() {
   Serial.printf("ELM327 WiFi adapter at %s:%u\n", WiFi.localIP().toString().c_str(),
                 ELM327_TCP_PORT);

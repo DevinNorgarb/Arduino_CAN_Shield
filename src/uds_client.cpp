@@ -43,6 +43,10 @@ int udsRequest(unsigned long reqId, unsigned long respId, const uint8_t *req,
 
   while ((int32_t)(deadline - millis()) > 0) {
     if (!canAvailable()) {
+      // Don't busy-spin: WiFi/AsyncTCP share this core and will drop the
+      // WebSocket if we starve them for the whole timeout.
+      yield();
+      delay(1);
       continue;
     }
 

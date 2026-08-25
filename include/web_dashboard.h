@@ -2,7 +2,9 @@
 
 void initWebDashboard();
 void handleWebDashboard();
-void broadcastObdState();
+// Push live OBD JSON to dashboards. Throttled to ~5 Hz unless force=true
+// (commands, scan milestones, heartbeats) so WiFi/WebSocket stay healthy.
+void broadcastObdState(bool force = false);
 
 // Blocks until the hotspot is associated, or timeoutMs elapses. Pumps the
 // WiFi/dashboard loop so mDNS and the ELM TCP path come up.
@@ -18,3 +20,6 @@ void broadcastNmea(const String &line);
 // Pushes a single candump-format CAN frame line to any connected dashboards,
 // where it's collected by the CAN recorder for download.
 void broadcastCanFrame(const String &line);
+
+// Run a dashboard command (local /ws or forwarded from the remote stream).
+void applyDashboardCommand(const String &cmd);

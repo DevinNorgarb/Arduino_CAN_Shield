@@ -8,6 +8,7 @@ void initElm327Bluetooth();
 void handleElm327();
 void elm327StartTcp();
 void elm327StopTcp();
+void elm327StopBluetooth();
 void elm327OnWifiUp();
 bool elm327ClientConnected();
 bool elm327UsingBluetooth();

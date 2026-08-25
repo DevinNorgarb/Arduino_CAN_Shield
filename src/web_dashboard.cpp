@@ -8,7 +8,9 @@
 #include "obd_state.h"
 #include "web_dashboard.h"
 #include "can_recorder.h"
+#include "can_stream.h"
 #include "elm327.h"
+#include "transport_prefs.h"
 
 namespace {
 
@@ -18,6 +20,7 @@ AsyncWebSocket ws("/ws");
 bool mdnsStarted = false;
 bool wifiWasConnected = false;
 bool wifiReleased = false;
+bool transportRebootPending = false;
 
 const char kDashboardHtml[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -59,6 +62,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
     }
     button:hover { background: #263449; }
     button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.active { background: #14532d; border-color: #166534; color: #bbf7d0; }
     button.danger { background: #7f1d1d; border-color: #991b1b; color: #fecaca; }
     .peaks { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: 12px; }
     .dtc-list { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
@@ -140,6 +144,21 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
         <div class="card" id="elm-ip-card"><div class="label">WiFi adapter</div><div class="value" id="elm-ip">--</div></div>
         <div class="card" id="elm-conn-card"><div class="label">App linked</div><div class="value" id="elm-conn">No</div></div>
       </div>
+    </div>
+
+    <div class="section" id="admin-section">
+      <div class="row">
+        <h2 style="margin:0">Admin · radio transport</h2>
+        <div class="spacer"></div>
+        <span class="status" id="transport-active">—</span>
+      </div>
+      <div class="status" style="margin-top:8px">Force WiFi or Bluetooth at next boot. The ESP32 has one 2.4&nbsp;GHz radio — switching mode saves the setting and reboots.</div>
+      <div class="row" style="margin-top:12px">
+        <button id="transport-auto" type="button">Auto</button>
+        <button id="transport-wifi" type="button">Force WiFi</button>
+        <button id="transport-bt" type="button">Force Bluetooth</button>
+      </div>
+      <div class="status" id="transport-status" style="margin-top:10px"></div>
     </div>
 
     <div class="section">
@@ -230,9 +249,14 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
         <button class="primary" id="rec-toggle">Start recording</button>
         <button id="rec-download">Download .log</button>
       </div>
+      <div class="row" style="margin-top:10px">
+        <span class="status" id="stream-status">Remote stream…</span>
+        <div class="spacer"></div>
+        <button id="stream-toggle" hidden>Pause stream</button>
+      </div>
       <details class="nmea" id="can-details" style="margin-top:12px">
         <summary>Raw CAN frames <span class="count" id="can-count"></span></summary>
-        <div class="nmea-log" id="can-log"><span class="nmea-empty">Not recording. Press "Start recording" to capture raw frames.</span></div>
+        <div class="nmea-log" id="can-log"><span class="nmea-empty">Not recording. Press "Start recording" to capture all CAN bus traffic (not just OBD).</span></div>
       </details>
     </div>
 
@@ -316,6 +340,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       drawChart('chart-speed', speedHist, SPEED_MAX, '#4ade80');
 
       renderElm(data);
+      renderTransport(data);
       renderDtc(data);
       renderEcus(data);
       renderPids(data);
@@ -360,6 +385,32 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       } else {
         st.textContent = 'Waiting for hotspot…';
         st.className = 'status disconnected';
+      }
+    }
+
+    function renderTransport(data) {
+      const pref = data.transport_pref || 'auto';
+      const active = data.elm_transport === 'bluetooth' ? 'bluetooth' : 'wifi';
+      const labels = { auto: 'Auto', wifi: 'Force WiFi', bluetooth: 'Force Bluetooth' };
+      document.getElementById('transport-active').textContent =
+        'Running: ' + (active === 'bluetooth' ? 'Bluetooth' : 'WiFi') +
+        ' · Boot: ' + (labels[pref] || pref);
+      ['auto', 'wifi', 'bt'].forEach(suffix => {
+        const id = suffix === 'bt' ? 'transport-bt' : 'transport-' + suffix;
+        const mode = suffix === 'bt' ? 'bluetooth' : suffix;
+        document.getElementById(id).classList.toggle('active', pref === mode);
+      });
+      const st = document.getElementById('transport-status');
+      if (data.transport_rebooting) {
+        st.textContent = 'Rebooting…';
+        st.className = 'status connected';
+      } else {
+        st.textContent = pref === 'auto'
+          ? 'Auto: hotspot within ~15s → WiFi, else Bluetooth.'
+          : (pref === 'wifi'
+            ? 'WiFi forced — no Bluetooth fallback at boot.'
+            : 'Bluetooth forced — dashboard unavailable until you switch back to WiFi.');
+        st.className = 'status';
       }
     }
 
@@ -496,6 +547,31 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       b.classList.toggle('danger', canRecording);
       b.classList.toggle('primary', !canRecording);
     }
+    function renderStream(data) {
+      const el = document.getElementById('stream-status');
+      const btn = document.getElementById('stream-toggle');
+      if (!data.stream_configured) {
+        el.textContent = 'Remote stream off — set CAN_STREAM_HOST in config.h';
+        el.className = 'status';
+        btn.hidden = true;
+        return;
+      }
+      btn.hidden = false;
+      btn.textContent = data.stream_paused ? 'Resume stream' : 'Pause stream';
+      const host = data.stream_host || '';
+      if (data.stream_paused) {
+        el.textContent = 'Remote stream paused · ' + host;
+        el.className = 'status';
+      } else if (data.stream_connected) {
+        el.textContent = 'Streaming to ' + host + ' · ' + (data.stream_sent || 0) +
+          ' frames' + (data.stream_dropped ? ' · ' + data.stream_dropped + ' dropped' : '');
+        el.className = 'status connected';
+      } else {
+        el.textContent = 'Connecting to ' + host + '…' +
+          (data.stream_dropped ? ' · ' + data.stream_dropped + ' dropped' : '');
+        el.className = 'status disconnected';
+      }
+    }
 
     let socket, reconnectTimer;
     function send(cmd) { if (socket && socket.readyState === 1) socket.send(cmd); }
@@ -526,6 +602,10 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       send(canRecording ? 'rec_start' : 'rec_stop');
       updateRecUi();
     };
+    document.getElementById('stream-toggle').onclick = () => {
+      const btn = document.getElementById('stream-toggle');
+      send(btn.textContent.indexOf('Resume') === 0 ? 'stream_resume' : 'stream_pause');
+    };
     document.getElementById('rec-download').onclick = () => {
       if (!canLines.length) { alert('No frames captured yet.'); return; }
       const blob = new Blob([canLines.join('\n') + '\n'], { type: 'text/plain' });
@@ -536,6 +616,16 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
       a.click();
       URL.revokeObjectURL(a.href);
     };
+
+    function setTransport(mode) {
+      const labels = { auto: 'Auto', wifi: 'Force WiFi', bluetooth: 'Force Bluetooth' };
+      if (!confirm('Save boot mode "' + labels[mode] + '" and reboot the ESP32?')) return;
+      send('transport_' + mode);
+      document.getElementById('transport-status').textContent = 'Rebooting…';
+    }
+    document.getElementById('transport-auto').onclick = () => setTransport('auto');
+    document.getElementById('transport-wifi').onclick = () => setTransport('wifi');
+    document.getElementById('transport-bt').onclick = () => setTransport('bluetooth');
 
     function connect() {
       const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -552,6 +642,7 @@ const char kDashboardHtml[] PROGMEM = R"rawliteral(
           canRecording = data.rec_active;
           updateRecUi();
         }
+        if (data.stream_configured !== undefined) renderStream(data);
         render(data);
       };
       socket.onclose = () => {
@@ -575,7 +666,9 @@ String buildObdJson() {
   const uint32_t ageMs =
       gObdState.lastUpdateMs == 0 ? 0 : millis() - gObdState.lastUpdateMs;
 
-  String json = "{";
+  String json;
+  json.reserve(4096);
+  json += "{";
   json += "\"rpm\":" + String(gObdState.rpm, 1) + ",";
   json += "\"speed_kmh\":" + String(gObdState.speedKmh) + ",";
   json += "\"coolant_c\":" + String(gObdState.coolantC) + ",";
@@ -668,11 +761,15 @@ String buildObdJson() {
     json += "]}";
   }
   json += "],";
+  // Skip the growing DID dump while a scan is in progress — progress updates
+  // stay small; the final "done" broadcast carries the full list.
   json += "\"engine_dids\":[";
-  for (uint8_t i = 0; i < gObdState.engineDidCount; i++) {
-    if (i > 0) json += ",";
-    json += "{\"id\":" + String(gObdState.engineDids[i].id) + ",";
-    json += "\"value\":\"" + String(gObdState.engineDids[i].value) + "\"}";
+  if (gObdState.ecuScanStatus != SCAN_RUNNING) {
+    for (uint8_t i = 0; i < gObdState.engineDidCount; i++) {
+      if (i > 0) json += ",";
+      json += "{\"id\":" + String(gObdState.engineDids[i].id) + ",";
+      json += "\"value\":\"" + String(gObdState.engineDids[i].value) + "\"}";
+    }
   }
   json += "],";
 
@@ -682,6 +779,8 @@ String buildObdJson() {
   json += "\"elm_port\":" + String(ELM327_TCP_PORT) + ",";
   json += "\"elm_transport\":\"" + String(elm327UsingBluetooth() ? "bluetooth" : "wifi") + "\",";
   json += "\"elm_connected\":" + boolStr(elm327ClientConnected()) + ",";
+  json += "\"transport_pref\":\"" + String(transportModeName(loadTransportMode())) + "\",";
+  json += "\"transport_rebooting\":" + boolStr(transportRebootPending) + ",";
 
   json += "\"gps_valid\":" + boolStr(gObdState.gpsValid) + ",";
   json += "\"lat\":" + String(gObdState.latitude, 6) + ",";
@@ -696,6 +795,12 @@ String buildObdJson() {
   json += "\"can_message\":\"" + String(canStatusMessage()) + "\",";
   json += "\"rec_active\":" + boolStr(canRecordActive()) + ",";
   json += "\"rec_count\":" + String(canRecordCount()) + ",";
+  json += "\"stream_configured\":" + boolStr(canStreamConfigured()) + ",";
+  json += "\"stream_connected\":" + boolStr(canStreamConnected()) + ",";
+  json += "\"stream_paused\":" + boolStr(canStreamPaused()) + ",";
+  json += "\"stream_host\":\"" + String(canStreamHost()) + "\",";
+  json += "\"stream_sent\":" + String(canStreamSent()) + ",";
+  json += "\"stream_dropped\":" + String(canStreamDropped()) + ",";
   json += "\"age_ms\":" + String(ageMs);
   json += "}";
 
@@ -719,6 +824,14 @@ void handleWsCommand(const String &cmd) {
     canRecordStart();
   } else if (cmd == "rec_stop") {
     canRecordStop();
+  } else if (cmd == "stream_pause") {
+    canStreamSetPaused(true);
+  } else if (cmd == "stream_resume") {
+    canStreamSetPaused(false);
+  } else if (cmd == "transport_auto" || cmd == "transport_wifi" || cmd == "transport_bluetooth") {
+    transportRebootPending = true;
+    broadcastObdState(true);
+    applyTransportCommand(cmd);
   } else {
     // UDS module commands: read_<key> / clear_<key> (e.g. read_abs, clear_airbag)
     for (uint8_t i = 0; i < UDS_MODULE_COUNT; i++) {
@@ -777,6 +890,9 @@ void onWiFiConnected() {
   Serial.print("Phone hotspot connected, dashboard at http://");
   Serial.print(WiFi.localIP());
   Serial.printf(" or http://%s.local\n", MDNS_HOSTNAME);
+  if (!elm327UsingBluetooth()) {
+    elm327StartTcp();
+  }
   elm327OnWifiUp();
   startMdns();
 }
@@ -807,6 +923,10 @@ void maintainWiFi() {
 
 }  // namespace
 
+void applyDashboardCommand(const String &cmd) {
+  handleWsCommand(cmd);
+}
+
 void initWebDashboard() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(WIFI_PS_MIN_MODEM);
@@ -833,6 +953,7 @@ void handleWebDashboard() {
   }
   maintainWiFi();
   ws.cleanupClients();
+  canStreamLoop();
 }
 
 bool waitForHotspot(uint32_t timeoutMs) {
@@ -850,6 +971,7 @@ bool waitForHotspot(uint32_t timeoutMs) {
 void stopWifiRadio() {
   wifiReleased = true;
   WiFi.setAutoReconnect(false);
+  canStreamStop();
   ws.closeAll();
   server.end();
   WiFi.disconnect(true, false);
@@ -858,13 +980,28 @@ void stopWifiRadio() {
   Serial.println("WiFi off — radio free for Bluetooth serial");
 }
 
-void broadcastObdState() {
+void broadcastObdState(bool force) {
+  static uint32_t lastBroadcastMs = 0;
+  const uint32_t now = millis();
+  if (!force && (now - lastBroadcastMs) < 200) {
+    return;
+  }
+  lastBroadcastMs = now;
+
+  const String json = buildObdJson();
+  canStreamSendText(json);
+
   if (ws.count() == 0) {
     return;
   }
 
-  const String json = buildObdJson();
-  ws.textAll(json);
+  // textAll() will queue forever / disconnect clients when the TCP send buffer
+  // is full (common on phone hotspots). Only push to clients that can accept.
+  for (AsyncWebSocketClient &client : ws.getClients()) {
+    if (client.status() == WS_CONNECTED && client.canSend()) {
+      client.text(json);
+    }
+  }
 }
 
 void broadcastNmea(const String &line) {
@@ -881,7 +1018,11 @@ void broadcastNmea(const String &line) {
     json += c;
   }
   json += "\"}";
-  ws.textAll(json);
+  for (AsyncWebSocketClient &client : ws.getClients()) {
+    if (client.status() == WS_CONNECTED && client.canSend()) {
+      client.text(json);
+    }
+  }
 }
 
 void broadcastCanFrame(const String &line) {
@@ -894,5 +1035,9 @@ void broadcastCanFrame(const String &line) {
   String json = "{\"can\":\"";
   json += line;
   json += "\"}";
-  ws.textAll(json);
+  for (AsyncWebSocketClient &client : ws.getClients()) {
+    if (client.status() == WS_CONNECTED && client.canSend()) {
+      client.text(json);
+    }
+  }
 }

@@ -1,0 +1,13 @@
+{
+	email dnorgarb@gmail.com
+}
+
+monitor.f1y.ing {
+	@head method HEAD
+	handle @head {
+		header Content-Type "text/html; charset=utf-8"
+		respond 200
+	}
+
+	reverse_proxy can-stream:8765
+}

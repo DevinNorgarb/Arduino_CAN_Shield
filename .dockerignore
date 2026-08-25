@@ -1,0 +1,10 @@
+.git
+.pio
+.vscode
+include
+lib
+test
+can-stream-data
+*.bin
+*.elf
+*.map

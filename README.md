@@ -105,6 +105,63 @@ If that doesn't resolve on your phone, check the serial monitor for the IP (ofte
 
 Live OBD data is pushed over WebSocket (`/ws`) whenever a new reading arrives.
 
+## Live CAN stream (remote WebSocket)
+
+The ESP32 can also act as a WebSocket **client** and push every live CAN frame
+to a remote processor over the phone hotspot's cellular uplink. This is
+independent of the dashboard recorder — set a host and frames start flowing
+as soon as WiFi is up.
+
+In `include/config.h`:
+
+```cpp
+#define CAN_STREAM_HOST "monitor.f1y.ing"
+#define CAN_STREAM_PORT 8765
+#define CAN_STREAM_PATH "/"
+#define CAN_STREAM_SSL  0
+```
+
+The server must be reachable from the phone (public hostname, VPS, or a
+tunnel such as Tailscale / Cloudflare). Empty `CAN_STREAM_HOST` disables the
+uplink.
+
+Production receiver runs on the **monitor** VPS:
+
+```
+https://monitor.f1y.ing/         dashboard (same UI as the ESP32)
+ws://monitor.f1y.ing:8765/       ESP32 ingest
+```
+
+SSH: `ssh ubuntu@monitor.f1y.ing` then `cd ~/can-stream && docker compose ps`.
+Frames append to `~/can-stream/can-stream-data/capture.ndjson`.
+
+A local receiver:
+
+```bash
+docker compose up --build
+```
+
+That publishes `ws://<host>:8765/` and appends every message to
+`can-stream-data/capture.ndjson`. Override the published port with
+`CAN_STREAM_PORT=9000 docker compose up --build`.
+
+Without Docker:
+
+```bash
+pip install websockets
+python scripts/can_stream_server.py --port 8765 --out capture.ndjson
+```
+
+Frames arrive as JSON batches:
+
+```json
+{"v":1,"frames":[{"t":12345,"seq":1,"tx":false,"id":2024,"ext":false,"data":"03410C1AF0000000"}]}
+```
+
+`t` is milliseconds since boot, `seq` is monotonic (gaps mean drops), `id` is
+the CAN identifier as an integer, `data` is hex. The dashboard shows connection
+status and a pause control next to the CAN recorder.
+
 ## Phone OBD apps (ELM327)
 
 One radio, one transport — chosen at boot:
@@ -112,11 +169,13 @@ One radio, one transport — chosen at boot:
 - **Hotspot on** within ~15s → WiFi ELM327 at `<ESP32-IP>:35000` (dashboard too).
 - **No hotspot** → WiFi is powered off, then Bluetooth serial **OBDII** / PIN **1234** (Android).
 
-They are never on together (Classic BT + WiFi crashes this ESP32). Reboot with the hotspot on or off to switch.
+They are never on together (Classic BT + WiFi crashes this ESP32). Use **Admin · radio transport** on the dashboard to force Auto, WiFi, or Bluetooth (saved in flash, reboots to apply).
 
 **WiFi (iPhone or Android):** Car Scanner → WiFi adapter → host = dashboard IP, port **35000**.
 
 **Bluetooth (Android only):** Settings → Bluetooth → **OBDII**, PIN **1234**. iPhone cannot use SPP.
+
+To switch back from forced Bluetooth (no dashboard), connect USB serial at 115200 and send `transport wifi` or `transport auto`.
 
 GPS (u-blox NEO on UART2) is still in the firmware but **disabled** (`ENABLE_GPS 0` in `include/config.h`). Set that to `1` to bring it back.
 
