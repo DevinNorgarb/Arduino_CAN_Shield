@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <SPI.h>
+#include <WiFi.h>
 #include <mcp_can.h>
 
 #include "config.h"
@@ -9,7 +10,9 @@
 #include "gps.h"
 #include "can_recorder.h"
 #include "can_io.h"
+#include "can_rx_irq.h"
 #include "uds_scan.h"
+#include "transport_prefs.h"
 
 MCP_CAN canBus(CAN_CS_PIN);
 
@@ -113,6 +116,7 @@ bool initCan() {
 
   canBus.setMode(MCP_NORMAL);
   gObdState.canReady = true;
+  canRxIrqInitPin();
 
   Serial.println("Listening for CAN bus activity (2s)...");
   gObdState.busActive = detectCanBusActivity(2000);
@@ -493,22 +497,60 @@ void setup() {
   }
 
   initGps();
-  initWebDashboard();
-  if (waitForHotspot(ELM327_HOTSPOT_WAIT_MS)) {
-    Serial.println("Hotspot up — ELM327 on WiFi :35000");
-    elm327StartTcp();
-  } else {
-    Serial.println("No hotspot — switching to Bluetooth serial");
-    stopWifiRadio();
-    delay(300);
-    initElm327Bluetooth();
+
+  const TransportMode transportMode = loadTransportMode();
+  Serial.printf("Transport preference: %s\n", transportModeName(transportMode));
+
+  switch (transportMode) {
+    case TransportMode::Bluetooth:
+      Serial.println("Forced Bluetooth — WiFi dashboard disabled");
+      delay(300);
+      initElm327Bluetooth();
+      break;
+
+    case TransportMode::Wifi:
+      Serial.println("Forced WiFi — waiting for hotspot (no Bluetooth fallback)");
+      initWebDashboard();
+      waitForHotspot(ELM327_HOTSPOT_WAIT_MS);
+      if (WiFi.status() == WL_CONNECTED) {
+        elm327StartTcp();
+      } else {
+        Serial.println("Hotspot not up yet — WiFi will keep retrying");
+      }
+      break;
+
+    case TransportMode::Auto:
+    default:
+      initWebDashboard();
+      if (waitForHotspot(ELM327_HOTSPOT_WAIT_MS)) {
+        Serial.println("Hotspot up — ELM327 on WiFi :35000");
+        elm327StartTcp();
+      } else {
+        Serial.println("No hotspot — switching to Bluetooth serial");
+        stopWifiRadio();
+        delay(300);
+        initElm327Bluetooth();
+      }
+      break;
   }
 }
 
 void loop() {
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.startsWith("transport_")) {
+      applyTransportCommand(line);
+    }
+  }
+
   handleWebDashboard();
   handleGps();
   handleElm327();
+
+  if (gObdState.canReady) {
+    canRecordDrainRx();
+  }
 
   if (gObdState.canReady && !elm327ClientConnected()) {
     handlePendingCommands();

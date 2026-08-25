@@ -44,6 +44,16 @@
 // Set true for vehicles that require 29-bit CAN IDs (e.g. some Honda)
 #define OBD_USE_EXTENDED_ID false
 
+// Live CAN uplink. The ESP32 is a WebSocket *client* that pushes every captured
+// frame (OBD polls and passive bus traffic) to a remote processor through the
+// phone hotspot's cellular path. Empty host disables the uplink.
+//
+// Production: ws://monitor.f1y.ing:8765  (monitor VPS, not NPM)
+#define CAN_STREAM_HOST "monitor.f1y.ing"
+#define CAN_STREAM_PORT 8765
+#define CAN_STREAM_PATH "/"
+#define CAN_STREAM_SSL 0
+
 // VW/VAG module UDS addressing for codes that generic OBD mode 03/04 cannot
 // reach. These are manufacturer-specific; verify for your vehicle. Defaults are
 // the common VAG addresses (physical request / response pairs, offset +0x6A).

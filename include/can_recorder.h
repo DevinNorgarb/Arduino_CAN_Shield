@@ -19,3 +19,11 @@ bool canRecordActive();
 uint32_t canRecordCount();
 
 void canRecordFrame(bool tx, unsigned long id, uint8_t len, const uint8_t *data);
+
+// Drain the MCP2515 RX buffer while recording or streaming. Woken by CAN_INT_PIN
+// interrupt so frames are read before the chip's two-frame buffer overflows.
+void canRecordDrainRx();
+
+// Enable the RX IRQ while the local recorder or the remote stream wants bus
+// traffic; detach it when neither does.
+void canCaptureSyncIrq();
